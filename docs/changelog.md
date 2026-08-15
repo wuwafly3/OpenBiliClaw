@@ -6,6 +6,8 @@
 
 ## 未发布
 
+- **新增四表面推荐曝光账本（ML 排序 Wave 0）**：新表 `recommendation_impressions` 记录推荐窗口在浏览器插件 / 桌面 Web / 移动 Web / CLI 四个表面的真实曝光，补上此前完全缺失的 (曝光, 无互动) 负样本来源——实测既有 1207 条推荐历史里 `presented` 全为 0，`mark_recommendations_presented` 只有 CLI 一个调用点，API 出流路径从不写曝光。表按 `(recommendation_id, surface)` 去重，重复曝光累加 `impression_count` 并保留历史最小 `position`，因此轮询客户端不能刷出多行、也不能洗掉曾排第一的事实；`GET /api/recommendations` 的每条返回路径（含 1 秒缓存命中）都按表面记账，同表面 60 秒内窗口不变则去抖。表面分类以 origin 判插件、以 `Referer` 的 `/web` 与 `/m` 挂载前缀分桌面/移动，无法判定时记 `unknown` 而非丢弃（错标的曝光仍可训练，丢掉的曝光是永久缺失的负样本）。账本与 `recommendations.presented` 严格分离：后者是未读徽标与主动通知的开关，serve 路径写它会同时清零未读并永久静音主动推送。表中不含标题 / URL / 作者 / 推荐文案 / 画像文本，也不含分数列（`recommendations.confidence` insert 后不再更新，按 `recommendation_id` 关联即得不可变的曝光时刻分数）；30 天 / 200,000 行有界保留。写入按 best-effort，遥测失败绝不使用户的推荐请求失败。新增只读脚本 `scripts/ml_impression_status.py` 报告采集进度与 Wave 0 / Wave 2 样本门槛，`scripts/ml_data_probe.py` 报告训练信号存量。
+
 - **项目首页与 README 重新对齐**：补齐一直遗漏的 YouTube / X 来源卡，使首页明确展示 B 站、小红书、抖音、YouTube、X、知乎、Reddit、Linux.do、Bangumi、V2EX、微博与开放 Web；首屏补回“本地运行、只为一个人构建、反馈可调教”的定位，产品入口从过时的“只有浏览器侧边栏”更新为浏览器插件、桌面 Web、移动 Web、Flutter 与 DSH 五端，并修正中文微博文案误用英文、Firefox、架构分层、聚合 Release 说明以及静态 HTML / 中文词典漂移。
 - **README 新增 Linux.do 友情链接（折叠）**：主项目 README（中英）顶部原有的「LINUX DO Community」徽章移除，改在 README 底部新增可折叠的「友情链接」区块，内含指向 https://linux.do/ 的 LINUX DO 友情徽章；讨论帖徽章保留。DSH 插件仓库（dsh-openbiliclaw）README 底部同步新增同款折叠友情链接。
 - 修复 `scripts/install.ps1` 在原生 Windows 上的一键安装解析失败（issue #157）：双引号字符串内 `$InstallDir:` 会被解析为作用域限定变量引用，导致整个脚本在 PowerShell parse 阶段直接报错，改为 `${InstallDir}`；同时为脚本补充 UTF-8 BOM，确保 Windows PowerShell 5.1（脚本声明 `#requires -Version 5.1`）按 UTF-8 解码含中文注释与 here-string 的内容；`Invoke-Bootstrap` 内的 `$args` 改名 `$bootstrapArgs`，避免遮蔽自动变量（`PSAvoidAssignmentToAutomaticVariable`）。

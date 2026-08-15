@@ -403,6 +403,16 @@ class _RawTrimPlan:
 _LOCK_RETRY_ATTEMPTS = 8
 _LOCK_RETRY_SLEEP_SECONDS = 0.02
 CONTENT_HISTORY_RETENTION_DAYS = 30
+# ML ranking Wave 0 impression ledger bounds. Mirrors the prefilter shadow
+# audit policy (30 days / hard row cap) so a long-running local install cannot
+# grow this table without bound. The cap is higher than the audit's 20k because
+# one serve window writes up to 20 rows and the ledger is the only negative
+# sample source — 200k rows is roughly a year of heavy daily use.
+RECOMMENDATION_IMPRESSION_RETENTION_DAYS = 30
+RECOMMENDATION_IMPRESSION_MAX_ROWS = 200_000
+_RECOMMENDATION_IMPRESSION_SURFACES = frozenset(
+    {"extension", "desktop_web", "mobile_web", "cli", "unknown"}
+)
 _CONTENT_HISTORY_CATEGORIES = frozenset({"clicked", "shown", "removed"})
 # CALIBRATION PROVENANCE: the recommendation endpoint has a 3s hard tail
 # target. Recommendation persistence inherits the existing eight-attempt retry
@@ -1218,6 +1228,48 @@ CREATE TABLE IF NOT EXISTS recommendations (
     FOREIGN KEY (bvid) REFERENCES content_cache(bvid)
 );
 
+-- Recommendation impression ledger (ML ranking Wave 0).
+--
+-- Why this is not ``recommendations.presented``: that column is a single
+-- boolean owned by the *unread / not-yet-notified* semantics
+-- (``count_unread_recommendations`` and ``get_notification_candidate`` both
+-- filter on ``presented = 0``). Writing it from the serve path would zero the
+-- unread badge and permanently silence proactive notifications. It also cannot
+-- express rank or repeat exposure, and ``GET /api/recommendations`` is polled
+-- on a 1s snapshot cache, so "served again" must not read as "seen again".
+--
+-- This table is the (exposure, no-interaction) negative-sample source for
+-- supervised ranking. It intentionally contains no title, URL, author,
+-- expression, or profile text — only identity plus ranking metadata, following
+-- the ``evaluator_prefilter_shadow_audit`` privacy precedent. Retention is
+-- enforced on every insert.
+--
+-- One row per (recommendation_id, surface): repeats bump ``impression_count``
+-- and ``last_impression_at``, and keep the *best* (smallest) observed
+-- ``position`` so polling cannot inflate the row count or wash out rank.
+--
+-- There is deliberately no score column. ``recommendations.confidence`` is
+-- written once at insert and never updated, so joining on
+-- ``recommendation_id`` yields the immutable score-at-exposure-time. Copying it
+-- here would duplicate state and, because ``RecommendationOut`` carries no
+-- confidence field, would silently record 0.0 on the HTTP surfaces.
+CREATE TABLE IF NOT EXISTS recommendation_impressions (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    recommendation_id   INTEGER NOT NULL,
+    item_key            TEXT NOT NULL DEFAULT '',
+    surface             TEXT NOT NULL,
+    position            INTEGER NOT NULL DEFAULT 0,
+    source_platform     TEXT NOT NULL DEFAULT '',
+    impression_count    INTEGER NOT NULL DEFAULT 1,
+    first_impression_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_impression_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (recommendation_id, surface)
+);
+CREATE INDEX IF NOT EXISTS idx_recommendation_impressions_first_seen
+    ON recommendation_impressions(first_impression_at);
+CREATE INDEX IF NOT EXISTS idx_recommendation_impressions_item
+    ON recommendation_impressions(item_key);
+
 -- Durable popup chat turns.  These let the side panel recover in-flight
 -- and completed replies after Chrome reloads or discards the panel page.
 CREATE TABLE IF NOT EXISTS chat_turns (
@@ -2028,6 +2080,7 @@ class Database:
         self._ensure_profile_update_ledger_table()
         self._ensure_confusions_table()
         self._ensure_watch_later_table()
+        self._ensure_recommendation_impressions_table()
         self._ensure_discovery_keywords_table()
         self._ensure_favorites_table()
         self._ensure_saved_sync_tables()
@@ -11428,6 +11481,106 @@ class Database:
             recommendation_ids,
         )
 
+    def record_recommendation_impressions(
+        self,
+        impressions: Sequence[Mapping[str, Any]],
+    ) -> int:
+        """Persist one serve window's impressions and enforce bounded retention.
+
+        Returns the number of ledger rows touched (created or bumped). Repeat
+        impressions of an already-logged ``(recommendation_id, surface)`` pair
+        update that row rather than adding one, so this is a write-volume
+        counter, not a distinct-card count — use
+        ``count_recommendation_impressions`` for inventory.
+
+        This is deliberately separate from ``mark_recommendations_presented``:
+        ``recommendations.presented`` drives the unread badge and the proactive
+        notification gate, so the serve path must not write it. See the
+        ``recommendation_impressions`` schema comment.
+
+        Callers treat this as best effort — the API layer suppresses failures so
+        a telemetry write can never fail a user's recommendation request.
+        """
+
+        params: list[tuple[Any, ...]] = []
+        for impression in impressions:
+            recommendation_id = int(impression.get("recommendation_id") or 0)
+            if recommendation_id <= 0:
+                raise ValueError("impression recommendation_id must be a positive integer")
+            surface = str(impression.get("surface") or "").strip().lower()
+            if surface not in _RECOMMENDATION_IMPRESSION_SURFACES:
+                allowed = sorted(_RECOMMENDATION_IMPRESSION_SURFACES)
+                raise ValueError(f"impression surface must be one of {allowed}")
+            position = int(impression.get("position") or 0)
+            if position < 0:
+                raise ValueError("impression position must be non-negative")
+            params.append(
+                (
+                    recommendation_id,
+                    str(impression.get("item_key") or ""),
+                    surface,
+                    position,
+                    str(impression.get("source_platform") or ""),
+                )
+            )
+        if not params:
+            return 0
+        connection = self.conn
+        changes_before = connection.total_changes
+        self._execute_many_write(
+            """
+            INSERT INTO recommendation_impressions (
+                recommendation_id,
+                item_key,
+                surface,
+                position,
+                source_platform
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(recommendation_id, surface) DO UPDATE SET
+                impression_count = impression_count + 1,
+                last_impression_at = CURRENT_TIMESTAMP,
+                -- Keep the best rank ever observed. A later poll that shows the
+                -- same card further down must not erase the fact that it once
+                -- reached the top of the window.
+                position = MIN(position, excluded.position),
+                item_key = CASE
+                    WHEN excluded.item_key <> '' THEN excluded.item_key
+                    ELSE item_key
+                END
+            """,
+            params,
+        )
+        # ``total_changes`` counts inserts and conflict updates alike, so it
+        # measures write volume rather than new cards.
+        touched = max(0, connection.total_changes - changes_before)
+        self._execute_write(
+            """
+            DELETE FROM recommendation_impressions
+            WHERE first_impression_at < datetime('now', ?)
+            """,
+            (f"-{RECOMMENDATION_IMPRESSION_RETENTION_DAYS} days",),
+        )
+        self._execute_write(
+            """
+            DELETE FROM recommendation_impressions
+            WHERE id IN (
+                SELECT id
+                FROM recommendation_impressions
+                ORDER BY first_impression_at DESC, id DESC
+                LIMIT -1 OFFSET ?
+            )
+            """,
+            (RECOMMENDATION_IMPRESSION_MAX_ROWS,),
+        )
+        return touched
+
+    def count_recommendation_impressions(self) -> int:
+        """Return the total number of logged impression rows."""
+        self._ensure_fresh_read()
+        cursor = self.conn.execute("SELECT COUNT(*) AS count FROM recommendation_impressions")
+        row = cursor.fetchone()
+        return int(row["count"]) if row is not None else 0
+
     def prune_content_history(
         self,
         *,
@@ -13688,6 +13841,29 @@ class Database:
             self.conn.execute(
                 "ALTER TABLE confusions ADD COLUMN replay_queue TEXT NOT NULL DEFAULT '[]'"
             )
+
+    def _ensure_recommendation_impressions_table(self) -> None:
+        """Create the ML-ranking impression ledger on pre-migration databases."""
+        self.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS recommendation_impressions (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                recommendation_id   INTEGER NOT NULL,
+                item_key            TEXT NOT NULL DEFAULT '',
+                surface             TEXT NOT NULL,
+                position            INTEGER NOT NULL DEFAULT 0,
+                source_platform     TEXT NOT NULL DEFAULT '',
+                impression_count    INTEGER NOT NULL DEFAULT 1,
+                first_impression_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_impression_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (recommendation_id, surface)
+            );
+            CREATE INDEX IF NOT EXISTS idx_recommendation_impressions_first_seen
+                ON recommendation_impressions(first_impression_at);
+            CREATE INDEX IF NOT EXISTS idx_recommendation_impressions_item
+                ON recommendation_impressions(item_key);
+            """
+        )
 
     def _ensure_watch_later_table(self) -> None:
         """Create the watch_later bookmarks table for existing databases."""

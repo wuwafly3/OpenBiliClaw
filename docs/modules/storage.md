@@ -71,6 +71,7 @@
 
 | 功能 | 状态 | 说明 |
 |------|------|------|
+| 四表面曝光账本（ML 排序 Wave 0） | ✅ | `recommendation_impressions` 记录推荐窗口在浏览器插件 / 桌面 Web / 移动 Web / CLI 四个表面的真实曝光，是监督排序唯一的 (曝光, 无互动) 负样本来源。按 `(recommendation_id, surface)` 去重、保留历史最小 `position`、30 天 / 200,000 行有界保留，不含标题 / URL / 作者 / 文案。与 `recommendations.presented`（未读徽标 + 主动通知开关）严格分离，serve 路径不写 `presented`。详见 [Recommendation Impression Ledger](#recommendation-impression-ledger) |
 | 观看完播判定（2026-07-27+） | ✅ | `events.inferred_satisfaction` 现在也覆盖 `view`：`sources/event_format._classify_view_completion` **只判正向**——完播 ≥`_FINISHED_WATCH_MIN_RATIO`（0.8）且观看 ≥15 秒记 `positive/finished_watch`，其余保持 `unknown/fallback`。低完播刻意不判负（自动播放 / 误点 / 预告 / 重看进度重置都长这样），否则会污染 `recent_negative_exemplars` 并影响内容评估。阈值校准见常量注释；改动 `watch_seconds` 来源后需重新校准 |
 | SQLite schema 初始化 | ✅ | `Database.initialize()` 自动创建核心表和索引，支持旧库增量补列 / 补索引；成熟库会自动补 `recommendations(bvid)` 与 `events(event_type, id DESC)` 热路径索引，并创建 `seen_items` canonical 已看账本。旧库初始化时按游标增量回填全部历史「已消费」事件（`view` / `favorite` / `like` / `coin`），不受旧版 2000 条窗口限制；类型集扩大时按 `scanned_event_types_version` 自动倒回重扫一次。 |
 | 视觉 / 弹幕 provenance 迁移 | ✅ | 旧 `content_cache` 自动补 keyframe/danmaku fingerprint、维度和采样签名列；旧 `user_visual_clusters` 补 provenance，另建单行 profile state。keyframe/danmaku selector 只对已有向量（`keyframe_count > 0` / `danmaku_text` 非空）响应 provider/model namespace、维度变化；确认 source no-data 的行不会因 namespace 或采样签名变化反复抓取。请求或已存维度为 0 都表示未知，不当作已证实不兼容；只有两个正维度实际不同才重排 |
@@ -464,6 +465,21 @@ cached_bilibili = db.get_unrecommended_content(
 - `mark_discovery_candidate_cached()` / `reject_discovery_candidate(..., status=...)` 只改写 `evaluating` / `evaluated` 行；terminal rows 不会被 stale caller 复活或覆盖。常见 rejection status 包括 `rejected_low_score`、`rejected_duplicate`、`rejected_cache_admission`、`rejected_temporal_stale`、`rejected_recently_viewed`、`rejected_franchise_quota`。
 - `count_discovery_candidates_by_status()` 与 `count_discovery_candidates_by_source_status()` 用于诊断待评估池生命周期分布。
 - `count_pool_readiness()["evaluated_pending"]` 只统计 `discovery_candidates(status='evaluated')` 中 disposition 为 `eligible` 的子集，用于 projected inventory；raw `evaluated_waiting_total` 由 coordinator 单独读取，只负责让 review-due/expired-only 或 no-headroom 队列继续触发生命周期清扫。`admitted_pending_copy` 与 `get_pool_candidates_needing_copy()` 共用 `_load_admitted_pending_copy_rows_on()`，不会用宽泛的 `pending` 差值推算。`admitted_pending_available` 再把 unrestricted `copy_ready` 按每 topic 三条窗口占位，表达调度可用 `eligible_available_first=True` 先领取能立即增加公开库存的行，再按 copy-ready 水位需要领取深层 backlog。
+
+### Recommendation Impression Ledger
+
+```python
+touched = db.record_recommendation_impressions(impression_records)
+total = db.count_recommendation_impressions()
+```
+
+- `recommendation_impressions` 是 ML 排序工作的曝光账本，也是监督排序唯一的 (曝光, 无互动) 负样本来源。表按 `UNIQUE (recommendation_id, surface)` 组织：同一张卡在同一表面被反复看到只累加 `impression_count` 与 `last_impression_at`，并保留**历史最小** `position`，因此轮询客户端既不能刷出多行，也不能把曾经排到第一的事实洗掉。
+- 它与 `recommendations.presented` 是两套语义，不可合并。`presented` 是未读徽标与主动通知的开关（`count_unread_recommendations()` 与 `get_notification_candidate()` 都以 `presented = 0` 为条件），serve 路径若写它会同时清零未读并永久静音主动推送。`presented` 也无法表达位次或重复曝光。
+- 表中没有分数列。`recommendations.confidence` 在 insert 时写入且此后不再更新，因此按 `recommendation_id` 关联即可取到不可变的「曝光时刻分数」；复制一份既是重复状态，又因为 `RecommendationOut` 不带 confidence 字段而会在 HTTP 表面静默记成 0.0。
+- 表中没有标题、URL、作者、推荐文案或画像文本，沿用 `evaluator_prefilter_shadow_audit` 的隐私先例；只保留 `recommendation_id` / `item_key` / `surface` / `position` / `source_platform` 与两个时间戳。
+- `surface` 限定为 `extension` / `desktop_web` / `mobile_web` / `cli` / `unknown` 五个枚举值，非法值直接拒绝。`unknown` 是刻意保留的兜底：错标的曝光仍是有效训练样本，丢掉的曝光则是永久缺失的负样本。
+- 每次 insert 后清理 30 天前记录并只保留最新 200,000 行。行数上界高于 prefilter audit 的 20,000，因为单次 serve 窗口最多写 20 行且该账本是唯一负样本来源，200,000 行约相当于一年重度日常使用。
+- 调用方按 best-effort 对待：API 与 CLI 都吞掉写入异常，遥测失败绝不使用户的推荐请求失败。
 
 ### Evaluator Prefilter Shadow Audit
 

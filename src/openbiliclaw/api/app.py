@@ -21,7 +21,7 @@ import subprocess
 import time
 import unicodedata
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -463,6 +463,15 @@ _FIRST_PAGE_TOPUP_DEBOUNCE_SECONDS = 30.0
 # is intentionally tiny: it is a load-shedding single-flight window, not a
 # user-visible freshness policy. Mutating recommendation routes invalidate it.
 _RECOMMENDATION_SNAPSHOT_TTL_SECONDS = 1.0
+# ML ranking Wave 0 impression debounce.
+# CALIBRATION PROVENANCE: /api/recommendations is polled by every open popup,
+# dashboard tab and mobile page; the response itself is cached for
+# _RECOMMENDATION_SNAPSHOT_TTL_SECONDS (1s). An actionable card can stay in the
+# unprocessed window for hours, so an undebounced logger would issue a 20-row
+# upsert per second per surface. 60s means an unchanged window costs at most one
+# write batch per minute per surface, while any genuine window change (reshuffle,
+# append, feedback) logs immediately because the signature changes.
+_IMPRESSION_LOG_DEBOUNCE_SECONDS = 60.0
 
 
 def _recommendation_snapshot_rows_and_expiry(
@@ -2233,6 +2242,10 @@ def create_app(
     recommendation_snapshot_expires_at = 0.0
     recommendation_snapshot_dislike_digest = ""
     recommendation_snapshot_lock = asyncio.Lock()
+    # ML ranking Wave 0: last logged impression window per surface, as
+    # (signature, monotonic_time). Keeps a polling client from re-writing the
+    # same 20 rows every second while an unchanged window stays on screen.
+    impression_log_signatures: dict[str, tuple[tuple[str, tuple[int, ...]], float]] = {}
 
     def _invalidate_recommendation_snapshot() -> None:
         nonlocal recommendation_snapshot_cache, recommendation_snapshot_cached_at
@@ -7442,6 +7455,91 @@ def create_app(
             ],
         )
 
+    def _impression_surface(request: Request | None) -> str:
+        """Classify which of the four user-facing surfaces issued this request.
+
+        Origin is authoritative for the extension (its scheme is unforgeable by
+        page JS). Web surfaces share one loopback origin, so they are separated
+        by the mount prefix in ``Referer`` — ``/web`` is the desktop mount and
+        ``/m`` the mobile mount (see the StaticFiles mounts near the end of
+        ``create_app``). Anything unclassifiable is logged as ``unknown``
+        instead of being dropped: a mislabelled surface is still a valid
+        exposure record for ranking, while a dropped one is a missing negative
+        sample. The CLI writes ``cli`` directly and never reaches this helper.
+        """
+        if request is None:
+            return "unknown"
+        from openbiliclaw import auth_core
+
+        if auth_core.is_extension_origin(request.headers.get("origin")):
+            return "extension"
+        referer = str(request.headers.get("referer") or "")
+        if referer:
+            path = urlsplit(referer).path
+            if path.startswith("/web"):
+                return "desktop_web"
+            if path.startswith("/m"):
+                return "mobile_web"
+        return "unknown"
+
+    def _record_recommendation_impressions(
+        items: Sequence[Any],
+        *,
+        surface: str,
+    ) -> None:
+        """Log one exposed recommendation window (ML ranking Wave 0).
+
+        Best effort by contract: every failure is swallowed so a telemetry
+        write can never fail a user's recommendation request. This does NOT
+        touch ``recommendations.presented`` — that column owns the unread badge
+        and the proactive-notification gate, and writing it here would silence
+        both.
+
+        ``GET /api/recommendations`` is polled continuously, and an actionable
+        card stays in the unprocessed window for hours. The per-surface
+        signature debounce below keeps a poll loop from issuing a 20-row write
+        every second; the storage upsert still dedups whatever does get through.
+        """
+        if not items:
+            return
+        record = getattr(ctx.database, "record_recommendation_impressions", None)
+        if not callable(record):
+            return
+        payload: list[dict[str, Any]] = []
+        for position, item in enumerate(items):
+            try:
+                recommendation_id = int(getattr(item, "id", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if recommendation_id <= 0:
+                continue
+            payload.append(
+                {
+                    "recommendation_id": recommendation_id,
+                    "item_key": str(getattr(item, "item_key", "") or ""),
+                    "surface": surface,
+                    "position": position,
+                    "source_platform": str(getattr(item, "source_platform", "") or ""),
+                }
+            )
+        if not payload:
+            return
+        signature = (
+            surface,
+            tuple(entry["recommendation_id"] for entry in payload),
+        )
+        now = time.monotonic()
+        previous = impression_log_signatures.get(surface)
+        if (
+            previous is not None
+            and previous[0] == signature
+            and now - previous[1] < _IMPRESSION_LOG_DEBOUNCE_SECONDS
+        ):
+            return
+        impression_log_signatures[surface] = (signature, now)
+        with suppress(Exception):
+            record(payload)
+
     async def _load_recommendations(
         disliked_topics: list[str] | None = None,
     ) -> tuple[RecommendationListResponse, float]:
@@ -7575,7 +7673,7 @@ def create_app(
         ), snapshot_expires_at
 
     @app.get("/api/recommendations", response_model=RecommendationListResponse)
-    async def recommendations() -> RecommendationListResponse:
+    async def recommendations(request: Request) -> RecommendationListResponse:
         """Return one coalesced recommendation snapshot.
 
         Restored browser sessions can contain dozens of stale dashboard tabs.
@@ -7583,11 +7681,17 @@ def create_app(
         history/content join at once. A one-second cache plus single-flight
         lock turns that burst into one database read while keeping interactive
         mutations immediately visible through explicit invalidation.
+
+        Every return path logs the window as an impression (ML ranking Wave 0),
+        including cache hits: a client that receives cards has shown them
+        regardless of where the bytes came from. The logger is debounced per
+        surface, so the 1s poll cache does not become a 1s write loop.
         """
         nonlocal recommendation_snapshot_cache, recommendation_snapshot_cached_at
         nonlocal recommendation_snapshot_expires_at
         nonlocal recommendation_snapshot_dislike_digest
 
+        surface = _impression_surface(request)
         now = time.monotonic()
         disliked_topics, dislike_digest = _effective_recommendation_dislikes()
         if (
@@ -7596,6 +7700,10 @@ def create_app(
             and now < recommendation_snapshot_expires_at
             and recommendation_snapshot_dislike_digest == dislike_digest
         ):
+            _record_recommendation_impressions(
+                recommendation_snapshot_cache.items,
+                surface=surface,
+            )
             return recommendation_snapshot_cache.model_copy(deep=True)
 
         async with recommendation_snapshot_lock:
@@ -7607,6 +7715,10 @@ def create_app(
                 and now < recommendation_snapshot_expires_at
                 and recommendation_snapshot_dislike_digest == dislike_digest
             ):
+                _record_recommendation_impressions(
+                    recommendation_snapshot_cache.items,
+                    surface=surface,
+                )
                 return recommendation_snapshot_cache.model_copy(deep=True)
             snapshot, snapshot_expires_at = await _load_recommendations(disliked_topics)
             latest_topics, latest_digest = _effective_recommendation_dislikes()
@@ -7617,6 +7729,7 @@ def create_app(
             recommendation_snapshot_cached_at = time.monotonic()
             recommendation_snapshot_expires_at = snapshot_expires_at
             recommendation_snapshot_dislike_digest = dislike_digest
+            _record_recommendation_impressions(snapshot.items, surface=surface)
             return snapshot
 
     def _content_history_item(row: dict[str, Any]) -> ContentHistoryItemOut:
@@ -8539,6 +8652,7 @@ def create_app(
 
     @app.post("/api/recommendations/reshuffle", response_model=RecommendationReshuffleResponse)
     async def reshuffle_recommendations(
+        request: Request,
         payload: Annotated[RecommendationReshuffleIn | None, Body()] = None,
     ) -> RecommendationReshuffleResponse:
         _invalidate_recommendation_snapshot()
@@ -8640,10 +8754,13 @@ def create_app(
             float(getattr(timings, "persist_ms", 0.0)),
             (time.perf_counter() - request_started) * 1000.0,
         )
-        return RecommendationReshuffleResponse(items=_serialize_recommendation_items(items))
+        serialized = _serialize_recommendation_items(items)
+        _record_recommendation_impressions(serialized, surface=_impression_surface(request))
+        return RecommendationReshuffleResponse(items=serialized)
 
     @app.post("/api/recommendations/append", response_model=RecommendationReshuffleResponse)
     async def append_recommendations(
+        request: Request,
         payload: RecommendationAppendIn,
     ) -> RecommendationReshuffleResponse:
         _invalidate_recommendation_snapshot()
@@ -8712,7 +8829,9 @@ def create_app(
             float(getattr(timings, "persist_ms", 0.0)),
             (time.perf_counter() - request_started) * 1000.0,
         )
-        return RecommendationReshuffleResponse(items=_serialize_recommendation_items(items))
+        serialized = _serialize_recommendation_items(items)
+        _record_recommendation_impressions(serialized, surface=_impression_surface(request))
+        return RecommendationReshuffleResponse(items=serialized)
 
     @app.post("/api/recommendations/refresh", response_model=RecommendationRefreshResponse)
     async def refresh_recommendations() -> RecommendationRefreshResponse:

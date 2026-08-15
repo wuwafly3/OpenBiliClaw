@@ -4389,6 +4389,39 @@ class RecommendationEngine:
             return
         self._database.mark_recommendations_presented(ids)
 
+    def record_impressions(self, items: list[Recommendation], *, surface: str) -> None:
+        """Log an exposed recommendation window (ML ranking Wave 0).
+
+        Separate from :meth:`mark_presented`: ``recommendations.presented``
+        drives the unread badge and the proactive-notification gate, while this
+        ledger is the (exposure, no-interaction) negative-sample source for
+        supervised ranking. The API layer has its own recorder for the HTTP
+        surfaces; this method is the CLI's path so all four surfaces write the
+        same table.
+
+        Best effort — a telemetry failure must never break a served batch.
+        """
+        record = getattr(self._database, "record_recommendation_impressions", None)
+        if not callable(record):
+            return
+        payload = [
+            {
+                "recommendation_id": int(item.recommendation_id),
+                "item_key": str(getattr(item.content, "item_key", "") or ""),
+                "surface": surface,
+                "position": position,
+                "source_platform": str(getattr(item.content, "source_platform", "") or ""),
+            }
+            for position, item in enumerate(items)
+            if int(getattr(item, "recommendation_id", 0) or 0) > 0
+        ]
+        if not payload:
+            return
+        try:
+            record(payload)
+        except Exception:
+            logger.debug("record_impressions failed for surface=%s", surface, exc_info=True)
+
     async def record_feedback(
         self,
         recommendation_id: int,

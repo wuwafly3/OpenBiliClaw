@@ -12503,6 +12503,9 @@ def recommend() -> None:
         presented_ids.append(item.recommendation_id)
 
     recommendation_engine.mark_presented(presented_ids)
+    # ML ranking Wave 0: the CLI is the fourth exposure surface. Printed cards
+    # are as "shown" as rendered ones, so they must reach the same ledger.
+    recommendation_engine.record_impressions(recommendations, surface="cli")
 
 
 @app.command()

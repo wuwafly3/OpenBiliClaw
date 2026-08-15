@@ -20,6 +20,7 @@ runtime 使用公开 `drain_pending_expression_copy(profile, limit<=60, max_extr
 
 | 任务 | 状态 | 说明 |
 |------|------|------|
+| 四表面曝光账本（ML 排序 Wave 0） | ✅ | `RecommendationEngine.record_impressions(items, surface=...)` 是 CLI 表面的曝光写入口（API 有自己的等价写入口），落到 `recommendation_impressions`。与 `mark_presented()` 严格分离：`presented` 归未读徽标与主动通知，曝光账本归训练负样本。best-effort，写库失败只记 DEBUG，不影响已服务批次 |
 | v0.3.191 视觉 embedding pipeline 完整契约 | ✅ | P1/P3 共享质心但与 P1 cover bonus 分开开关；质心、关键帧、弹幕状态绑定 embedding fingerprint / 维度，关键帧再绑定采样签名；瞬时失败保持可重试，成功空结果才推进完成状态。预热使用配置 limit 和当前 servable pool，跨平台 bonus 以 0 为固定点分段归一化，离线 A/B 脚本复用生产公式 |
 | 6.1 推荐排序 | ✅ | 从 `content_cache` 选未推荐内容、按分数排序、以 canonical `item_key` 写入推荐历史 |
 | 6.2 朋友式推荐表达 | ✅ | 用 LLM 生成朋友式推荐理由和个性化 topic，并在 CLI 中真实展示；`recommendation.*` 的分类和短文案调用在未显式指定时统一用 `reasoning_effort=""`，避免 DeepSeek thinking 拉长文案回填 |
