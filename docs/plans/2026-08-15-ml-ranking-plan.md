@@ -27,7 +27,9 @@
 
 1. `ml/features.py`：确定性纯函数特征提取（spec S1.2 特征集），
    输入 `DiscoveredContent` + 画像视图，输出定长 numpy 向量 + 特征名清单。
-   **禁** `topic_group` / `style_key` / `franchise_key` / `temporal_*`（标签泄漏）。
+   **禁** `topic_group` / `style_key` / `franchise_key` / `temporal_*`（标签泄漏；
+   多任务原型证实自预测 tags 只能挽回该信息约 4% 增量，两阶段辅助头方案
+   已按 2026-08-16 复核降级为证据，见 `docs/plans/2026-08-16-ml-multitask-probe.md`）。
 2. `pyproject.toml` 新增 `[ml]` extra（训练用 numpy / scikit-learn 显式声明），
    运行时推理只依赖 numpy；numpy 从"环境偶然可用"提升为显式依赖。
 3. `scripts/train_relevance_model.py`：离线训练浅模型（logistic / 浅 GBDT），

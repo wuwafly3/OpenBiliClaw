@@ -274,12 +274,14 @@ y = 0  otherwise
   边界（§2.6 画像 2 小时内漂移 12 次）。
 
 **S1.2** 特征集只用评估时刻已有、零额外网络成本的量：
-profile↔候选文本余弦、profile↔封面余弦（多模态开启时）、
-互动计数的对数与 `engagement_available` 掩码、时长、发布年龄、
+profile↔候选文本余弦（含 max/mean 与可用性掩码）、profile↔封面余弦（多模态开启时）、
+互动计数的对数与 `engagement_available` 掩码、时长、发布年龄、文本长度统计、
 `source_platform` / `source_strategy` / `content_type` one-hot、
 `rating_score` / `rating_count` / `source_rank`。
 **不得**引入 `topic_group` / `style_key` / `franchise_key` / `temporal_*` ——
-这些是同一次 LLM 调用的**输出**，用作特征即标签泄漏，且线上无 LLM 时不存在。
+这些是同一次 LLM 调用的**输出**，用作特征即标签泄漏，且线上无 LLM 时不存在
+（多任务原型实验证实辅助头预测的 tags 只能挽回该信息约 4% 的增量，
+见 `docs/plans/2026-08-16-ml-multitask-probe.md`）。
 **不得**引入需要新 LLM 调用的特征。
 
 **S1.3** 模型形态：离线训练（`[ml]` 可选依赖），运行时**纯 numpy 推理**，
