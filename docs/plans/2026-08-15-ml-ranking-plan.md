@@ -29,9 +29,15 @@
 
 ## Wave 1 — 准入二分类蒸馏（成本项）
 
+0. **廉价标签通道（S1.2a 已定案，前置）**：tags-only LLM 通道
+   （无画像块 / 批 rubric，仅输出 topic/style/temporal）+ 单价实测
+   （决定 S1.8 成本模型与验收线）+ 通道输出落库 schema
+   （`discovery_candidates` 标注列 + 标注来源标记）。
+   依据：tags oracle 消融 Δρ=+0.111（`docs/plans/2026-08-16-ml-tags-ablation-probe.md`）。
 1. `ml/features.py`：确定性纯函数特征提取（spec S1.2 特征集，
    含候选文本向量降维投影 ≤32 维——pairwise 原型实测当前特征集的教师
-   排序复现上限 ρ≈0.46 / 准入 AUC≈0.72–0.80，文本向量本体是下一特征杠杆），
+   排序复现上限 ρ≈0.46 / 准入 AUC≈0.72–0.80，文本向量本体是下一特征杠杆；
+   含 S1.2a 廉价通道标注特征），
    输入 `DiscoveredContent` + 画像视图，输出定长 numpy 向量 + 特征名清单。
    **禁** `topic_group` / `style_key` / `franchise_key` / `temporal_*`（标签泄漏；
    多任务原型证实自预测 tags 只能挽回该信息约 4% 增量，两阶段辅助头方案
