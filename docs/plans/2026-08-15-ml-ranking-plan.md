@@ -6,37 +6,38 @@
 
 ## Wave 0 — 仪器化（阻塞后续全部 Wave）
 
-1. 修复曝光漏斗：`api/app.py` 出流路径写 `presented=1, presented_at`，
-   覆盖插件 / desktop web / mobile web / CLI 四面；补四面回归测试。
-2. 新增 `ranking_feature_log` 表 + 写入点（serve 时 top-K 与淘汰各一行），
+1. ✅ **曝光账本**（commit `de7de536`）：`recommendation_impressions` 表 +
+   四面写入（插件 / desktop web / mobile web / CLI），与 `presented` 严格分离。
+2. `ranking_feature_log` 表 + 写入点（serve 时 top-K 与淘汰各一行），
    隐私安全字段集，30 天保留，沿用 `record_prefilter_shadow_decisions` 的形状。
-3. `scripts/export_ranking_dataset.py`：把 `discovery_candidates` +
-   `evaluator_prefilter_shadow_audit` 的未截断 (特征, llm_score) 导出为
-   版本化数据集，脱离 30 天保留期。
+3. `scripts/export_ranking_dataset.py`：把 `discovery_candidates`
+   （`cached` + `rejected_low_score`）未截断 (特征, 分数) 导出为版本化数据集，
+   二分类标签按 S1.1 规则在导出时计算并冻结，脱离 30 天保留期。
 4. 冻结 `engagement_label` 定义（spec 附录 A）并实现纯函数 + 单测。
-5. 采集 7 天真实使用数据；负样本 ≥ 300 条方可进 Wave 1 训练。
+5. 采集真实使用数据；负样本 ≥ 300 条方可进 Wave 1 训练。
 
-**门:** 曝光行数 > 0；(曝光, 无互动) 负样本 ≥ 300。
+**门:** 曝光行数 > 0；（曝光, 无互动）负样本 ≥ 300。
 
-## Wave 1 — relevance 蒸馏
+## Wave 1 — 准入二分类蒸馏（成本项）
 
-1. `ml/features.py`：确定性纯函数特征提取（spec S1.1 特征集），
+1. `ml/features.py`：确定性纯函数特征提取（spec S1.2 特征集），
    输入 `DiscoveredContent` + 画像视图，输出定长 numpy 向量 + 特征名清单。
+   **禁** `topic_group` / `style_key` / `franchise_key` / `temporal_*`（标签泄漏）。
 2. `pyproject.toml` 新增 `[ml]` extra（训练用 numpy / scikit-learn 显式声明），
    运行时推理只依赖 numpy；numpy 从"环境偶然可用"提升为显式依赖。
-3. `scripts/train_relevance_model.py`：离线训练，输出版本化 artifact
-   （权重 + 特征名 + 特征版本 + 训练集指纹）。
+3. `scripts/train_relevance_model.py`：离线训练浅模型（logistic / 浅 GBDT），
+   输出版本化 artifact（权重 + 特征名 + 特征版本 + 训练集指纹）。
 4. `ml/inference.py`：纯 numpy 推理 + artifact 版本校验 + fail-open 回落 LLM。
 5. 配置开关 `[discovery].relevance_scorer = "llm" | "shadow" | "ml"`，默认 `llm`；
    config 校验 + round-trip 测试；API / CLI / RuntimeContext 三个组装根注入。
-6. `shadow` 模式：ML 与 LLM 同时打分，差异写 `ranking_feature_log`，不影响准入。
-7. `scripts/evaluate_relevance_distillation.py`：算 spec S1.4 四项门槛
-   （Spearman / top-25 Jaccard / 准入线一致率 / 分平台分层）。
-8. 阈值重标定：0.60 / 0.58 / 0.75 / 0.80 在 ML 尺度上重标，
-   注释写标定溯源与分位数对齐证据。
-9. 保留 LLM 调用集定义（不确定带 + 校准集）落地为代码常量 + 注释。
+6. `shadow` 模式：ML 与 LLM 同时判定，分歧写 `ranking_feature_log`，不影响准入。
+7. `scripts/evaluate_relevance_distillation.py`：算 spec S1.5 六项门槛
+   （AUC / 一致率 / FPR / FNR / Brier / 分平台分层）。
+8. 阈值重标定 **C1–C7 全部 7 个常数**（§3.1）：准入线按 FPR/FNR 权衡选点，
+   delight/通知/tier 取同分位，注释写标定溯源与分位数对齐证据。
+9. LLM 保留调用集定义（y=1 候选 + 不确定带 + 校准集）落地为代码常量 + 注释。
 
-**门:** S1.4 四项全过（含分平台分层）；`discovery.evaluate_batch` token ≤ 基线 30%。
+**门:** S1.5 六项全过（含分平台分层）；`discovery.evaluate_batch` token ≤ 基线 70%。
 
 ## Wave 2 — 学习排序总分
 
@@ -51,9 +52,9 @@
 
 ## Wave 3 — 教师回路
 
-1. LLM 调用收敛到不确定带 + 周期校准集。
+1. LLM 调用收敛到三种情形（y=1 候选 + 不确定带 + 周期校准集）。
 2. 教师标签持续入训练集；模型按版本重训并留存评估记录。
-3. 漂移告警：校准集 Spearman ρ 跌破门槛自动回落 `shadow`。
+3. 漂移告警：校准集 ROC-AUC 或准入线一致率跌破门槛自动回落 `shadow`。
 
 ## Wave 4 — 文档与发布
 
@@ -63,9 +64,11 @@
    ML 推理块与训练 artifact 依赖。
 4. README CN/EN 📌 highlights 替换（≤4 条，CN/EN 同步）。
 
-## 当前阻塞项（实测）
+## 当前状态（实测）
 
-- **曝光日志为 0**（`presented=0` / 1207 行）→ Wave 2 无法验收。
-- **人类正样本约 50 条**（like 16 + favorite 关联部分）→ 低于 Wave 2 门槛 200。
-- **教师分对 like/dislike 的 AUC = 0.4513** → Wave 1 只能声称成本，不能声称质量。
-- **未截断教师样本约 1566 行**，且两张来源表都是 30 天滚动保留 → Wave 0 第 3 步必须先做。
+- ✅ **曝光账本已落地并合并到 main**（commit `de7de536`）。
+- **人类正样本约 50 条**（like 16 + favorite 关联部分）→ 低于 Wave 2 门槛 200，
+  采集进行中。
+- **教师分对 like/dislike 的 AUC = 0.4513** → Wave 1 只声称成本，不声称质量。
+- **Wave 1 训练集 = 578 行**（`discovery_candidates` cached 330 + rejected 248），
+  未截断；来源表 30 天滚动保留 → Wave 0 第 3 步必须先导出固化。
