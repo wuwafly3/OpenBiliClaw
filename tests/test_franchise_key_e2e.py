@@ -275,7 +275,7 @@ async def test_evaluator_propagates_llm_franchise_key_through_to_db(
         source_context="test",
     )
     cached = engine._eval_cache[cache_key]
-    assert len(cached) == 17
+    assert len(cached) == 18  # v6 appends score_source
     assert cached[4] == "原神"
     assert cached[5:8] == ("evergreen", 0.9, "核心价值不依赖发布日期")
 

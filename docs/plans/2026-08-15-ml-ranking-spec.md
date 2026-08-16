@@ -54,9 +54,10 @@ relevance 在管线中的实际角色是准入门，不是精排分（§2.7 给�
 | `evaluator_prefilter_shadow_audit.llm_score` | 967 | 0.00–0.90 | 未截断，且自带 `similarity` 特征 |
 
 `content_cache` 的分布证实了截断（0.6 以下为 0 行）。`discovery_candidates`
-是阶段 1 二分类训练集的**唯一来源**（`cached` 330 + `rejected_low_score` 248 =
-578 行）。两张表都有 30 天保留期（`prefilter_audit.py:26`、`database.py:405`），
-阶段 0 必须先固化快照。
+是阶段 1 二分类训练集的**唯一来源**；S0.3a 溯源白名单口径下为
+**686 行**（非零教师分 599 + 从 shadow_audit 恢复的 cap 置零真阳性 87，
+两源分数一致性 max = 0.00）。两张表都有 30 天保留期
+（`prefilter_audit.py:26`、`database.py:405`），阶段 0 必须先固化快照。
 
 `evaluator_prefilter_shadow_audit` 里 `similarity`（profile↔候选 embedding 余弦）
 与 `llm_score` 的 Pearson r = **0.2621**（n=967）。单一 embedding 相似度远不足以
@@ -215,10 +216,25 @@ top-K 与被淘汰的候选各记录一行：请求内 rank、模型分、教师
 `evaluator_prefilter_shadow_audit` 的隐私安全先例）。对二分类（§2.7）而言，
 这是阶段 2 学习排序的特征来源，阶段 1 训练**不依赖**它。
 
-**S0.3 教师标签快照固化**：把 `discovery_candidates`（`cached` + `rejected_low_score`）
+**S0.3 教师标签快照固化**：把 `discovery_candidates`
 未截断 (特征, 分数) 对导出为版本化数据集文件，脱离 30 天保留期。
-二分类标签在导出时按 S1.1 规则计算（`score >= effective_admission_threshold`），
-导出即冻结，不做二次打标。
+二分类标签在导出时按 S1.1 规则计算
+（`teacher_score >= effective_admission_threshold`，`teacher_score` 取
+S0.3a 溯源白名单的 `llm_score_raw`），导出即冻结，不做二次打标。
+
+**S0.3a 分数溯源（已落地）**：`discovery_candidates.relevance_score` 并非全部来自
+教师——intra-batch franchise/style cap 会把 ≥0.5 的分数原地置零、单条评估异常回退
+0.0、prefilter enforce 写 `max_sim*0.5` 伪分、recently-viewed / 批截断 / 响应缺成员
+也产生非教师 0 分，且 reason-diet 会把多数低分行的 reason 清空，事后无法区分。
+现已为每条评估写入 `score_source`（taxonomy 见
+`discovery/score_source.py`：`llm` / `cap_franchise` / `cap_style` /
+`prefilter` / `viewed` / `eval_error` / `response_missing` / `truncated`，
+空串 = 溯源机制上线前的历史行）与 `llm_score_raw`（cap 置零前的教师原始分）。
+导出数据集**只允许** `score_source ∈ {llm, cap_franchise, cap_style}` 且
+`llm_score_raw IS NOT NULL` 的行，统一走
+`Database.get_teacher_labeled_discovery_candidates()`，标签取 `llm_score_raw`
+（cap 行的 `relevance_score` 已被置零，不可用作标签）。`content_cache` 行天然
+全部是过准入门的教师分，不受此问题影响。
 
 **S0.4 隐式标签定义**：把 `watch_seconds` / `page_dwell_seconds` / `favorite` /
 `like` / `dislike` 归一成单一 `engagement_label`，定义写进本 spec 附录并冻结。
@@ -235,18 +251,25 @@ LLM 是否会让它过线。理由见 §2.7 —— relevance 在管线里的实�
 **S1.1 标签定义（冻结）**
 
 ```
-y = 1  if  llm_relevance_score >= effective_admission_threshold(source_strategy)
+y = 1  if  teacher_score >= effective_admission_threshold(source_strategy)
 y = 0  otherwise
 ```
 
+- **`teacher_score` 的取值来源按 S0.3a 溯源白名单**：教师判定行
+  （`score_source ∈ {llm, cap_franchise, cap_style}`）取 `llm_score_raw`
+  ——cap 置零行的 `relevance_score` 已被改为 0.0，直接用会把教师判 0.5–0.9
+  的行打成假 y=0；溯源机制上线前的历史行（`score_source = ''`）来源未知，
+  排除而非猜测。
 - 阈值按行取 `effective_admission_threshold`（普通 0.60 / explore 0.58），
   **不是**全局常数 —— explore 行用 0.60 打标会误判。
 - 标签**只从分数计算，不看 `status`**：`rejected_franchise_quota` 与
   `rejected_cache_admission` 共 21 行分数高于准入线，是结构规则拒的（§3.2 末）。
-- 训练集只用未截断来源：`discovery_candidates` 的 `cached`（330，y=1）+
-  `rejected_low_score`（248，y=0）= **578 行**，正负比约 1.33:1。
-  `content_cache` 的 1810 行全部 `y=1`（0.60 截断），**只可作正样本补充，
-  不可单独构成训练集**。
+- 训练集只用未截断来源：`discovery_candidates` 的教师判定白名单行。
+  实测口径（2026-08-16）：非零教师分 599 行 + 从 shadow_audit 恢复的
+  cap 置零真阳性 87 行（92% 恢复分 ≥0.5）≈ **686 行**；其中
+  `cached` 330 / `rejected_low_score`（非零部分）248 / 结构性拒绝 21 /
+  恢复行 87。`content_cache` 的 1810 行全部 `y=1`（0.60 截断），
+  **只可作正样本补充，不可单独构成训练集**。
 - 按 `profile_digest` 分组切分留出集，同一画像版本的行不得跨越 train/holdout
   边界（§2.6 画像 2 小时内漂移 12 次）。
 
@@ -260,7 +283,7 @@ profile↔候选文本余弦、profile↔封面余弦（多模态开启时）、
 **不得**引入需要新 LLM 调用的特征。
 
 **S1.3** 模型形态：离线训练（`[ml]` 可选依赖），运行时**纯 numpy 推理**，
-权重以版本化 artifact 落盘。578 行样本只支持带强正则的浅模型
+权重以版本化 artifact 落盘。686 行样本（S0.3a 溯源白名单口径）只支持带强正则的浅模型
 （logistic / 浅 GBDT），不支持深网。运行时不新增 sklearn / lightgbm 依赖 ——
 local-first 桌面分发不接受为推理引入训练框架。
 
@@ -303,7 +326,7 @@ FPR 比 FNR 收得更紧，因为假准入把坏内容推到用户面前，假�
 多样性分桶、疲劳轴与时效生命周期的输入。因此 LLM 调用不会消失，只会收窄为：
 判定为 y=1 的候选（需要结构化标注才能入池）+ 概率落在决策阈邻域的不确定带
 + 周期性随机校准集。成本收益来自**不再为注定被拒的候选付 LLM 费用**
-—— 按当前 578 行样本的正负比，理论上界约省 43% 的评估调用。
+—— 按当前 686 行样本的正负比，理论上界约省 43% 的评估调用。
 
 **验收**：`discovery.evaluate_batch` token 降到基线的 ≤70%（对应上述理论上界的
 保守取值，非 ≤30% —— 结构化标注调用无法省去）；S1.5 六项门槛全过（含分层）；
@@ -352,7 +375,7 @@ source_monotony / serendipity）从手工常数变为学习到的贡献，
 | 误以为能省下全部评估调用 | S1.8：结构化标注仍需 LLM，验收改为 ≤70% 而非 ≤30% |
 | 为推理引入重依赖 | 运行时纯 numpy；训练进 `[ml]` extra |
 | 空 / 失败模型结果被缓存 | 沿用硬规则 #2：任何模型产出写库前校验，非法值不落盘 |
-| 578 行样本过拟合自证 | 浅模型 + 强正则；按画像版本分组留出；分平台分层验收 |
+| 686 行样本过拟合自证 | 浅模型 + 强正则；按画像版本分组留出；分平台分层验收 |
 | 样本量不足导致过拟合自证 | S2.5 正样本门槛；留出集 + bootstrap 区间 |
 
 ## 6. 文档与四面同步义务

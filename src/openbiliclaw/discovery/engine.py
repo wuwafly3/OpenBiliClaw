@@ -38,6 +38,16 @@ from openbiliclaw.discovery.prefilter_audit import (
     is_explicit_strong_interest_context,
     sanitize_prefilter_platform,
 )
+from openbiliclaw.discovery.score_source import (
+    SCORE_SOURCE_CAP_FRANCHISE,
+    SCORE_SOURCE_CAP_STYLE,
+    SCORE_SOURCE_EVAL_ERROR,
+    SCORE_SOURCE_LLM,
+    SCORE_SOURCE_PREFILTER,
+    SCORE_SOURCE_RESPONSE_MISSING,
+    SCORE_SOURCE_TRUNCATED,
+    SCORE_SOURCE_VIEWED,
+)
 from openbiliclaw.discovery.strategies._utils import (
     _CONTENT_PROMPT_DOMAIN_CAP,
     _CONTENT_PROMPT_INTEREST_CAP,
@@ -120,12 +130,36 @@ _EvalCacheEntryV5 = tuple[
     str,
     bool,
 ]
+# v6 appends ``score_source``: the enforce-mode prefilter also writes pseudo
+# scores through this cache, so a hit must not be re-labeled as an LLM
+# judgment. Shorter legacy tuples decode with ``SCORE_SOURCE_LLM``.
+_EvalCacheEntryV6 = tuple[
+    float,
+    str,
+    str,
+    str,
+    str,
+    str,
+    float,
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    bool,
+    str,
+]
 _EvalCacheEntry = (
     tuple[float, str, str, str]
     | tuple[float, str, str, str, str]
     | _EvalCacheEntryV4
     | _EvalCacheEntryV5Legacy
     | _EvalCacheEntryV5
+    | _EvalCacheEntryV6
 )
 _BILIBILI_CONTENT_ID_PATTERN = re.compile(r"^BV[0-9A-Za-z]+$")
 _CANONICAL_STORAGE_KEY_PLATFORMS = frozenset(
@@ -464,11 +498,18 @@ def _apply_temporal_evaluation(
 
 def _decode_eval_cache_entry(
     cached: _EvalCacheEntry,
-) -> tuple[float, str, str, str, str, TemporalEvaluation]:
-    """Decode v5 evaluator cache tuples and legacy 4/5/9-field entries."""
+) -> tuple[float, str, str, str, str, TemporalEvaluation, str]:
+    """Decode evaluator cache tuples and legacy 4/5/9-field entries.
+
+    Returns the provenance (``score_source``) as the final element; legacy
+    tuples predate the taxonomy and only ever held raw LLM results.
+    """
 
     score, reason, topic_group, style_key = cached[:4]
     franchise_key = cached[4] if len(cached) >= 5 else ""
+    score_source = SCORE_SOURCE_LLM
+    if len(cached) >= 18:
+        score_source = cast("_EvalCacheEntryV6", cached)[17]
     temporal = TemporalEvaluation()
     if len(cached) >= 17:
         cached_v5 = cast("_EvalCacheEntryV5", cached)
@@ -509,13 +550,13 @@ def _decode_eval_cache_entry(
             temporal_reason=cached_v4[7],
             temporal_policy_version=cached_v4[8],
         )
-    return score, reason, topic_group, style_key, franchise_key, temporal
+    return score, reason, topic_group, style_key, franchise_key, temporal, score_source
 
 
 def _eval_cache_entry_for_content(
     content: DiscoveredContent,
-) -> _EvalCacheEntryV5:
-    """Build the v5 in-memory cache shape from an evaluated candidate."""
+) -> _EvalCacheEntryV6:
+    """Build the v6 in-memory cache shape from an evaluated candidate."""
 
     return (
         content.relevance_score,
@@ -535,6 +576,7 @@ def _eval_cache_entry_for_content(
         content.temporal_next_review_at,
         content.temporal_evaluated_at,
         content.temporal_evidence_complete,
+        content.score_source or SCORE_SOURCE_LLM,
     )
 
 
@@ -781,6 +823,13 @@ class DiscoveredContent:
     discovery_lane: str = ""
     relevance_score: float = 0.0  # 0.0 - 1.0 (based on user soul)
     relevance_reason: str = ""  # Why this is relevant to the user
+    # Provenance of ``relevance_score`` (see SCORE_SOURCE_* constants). The
+    # score a distillation model may train on is ``llm_score_raw`` when
+    # ``score_source`` is an LLM-judgment source; every other value means the
+    # final score was zeroed or synthesized deterministically and must not
+    # enter the teacher-label dataset.
+    score_source: str = ""
+    llm_score_raw: float | None = None  # Teacher judgment before cap zeroing
     temporal_class: str = "unknown"  # Why this content's value may expire
     temporal_confidence: float = 0.0  # Evaluator confidence in temporal_class
     temporal_reason: str = ""  # Short diagnostic for the temporal classification
@@ -2085,13 +2134,15 @@ class ContentDiscoveryEngine:
         )
         cached = self._get_eval_cache_entry(cache_key)
         if cached is not None:
-            score, reason, topic_group, style_key, franchise_key, temporal = (
+            score, reason, topic_group, style_key, franchise_key, temporal, score_source = (
                 _decode_eval_cache_entry(cached)
             )
             normalized_reason = normalize_evaluation_reason(score, reason)
             if normalized_reason is not None:
                 content.relevance_score = score
                 content.relevance_reason = normalized_reason
+                content.score_source = score_source
+                content.llm_score_raw = score if score_source == SCORE_SOURCE_LLM else None
                 content.topic_group = topic_group
                 content.style_key = normalize_style_key(style_key)
                 content.franchise_key = franchise_key
@@ -2212,10 +2263,14 @@ class ContentDiscoveryEngine:
             temporal = parse_temporal_evaluation(payload)
         except Exception:
             logger.exception("Failed to evaluate discovered content: %s", content.bvid)
+            content.score_source = SCORE_SOURCE_EVAL_ERROR
+            content.llm_score_raw = None
             return 0.0
 
         content.relevance_score = score
         content.relevance_reason = reason
+        content.score_source = SCORE_SOURCE_LLM
+        content.llm_score_raw = score
         content.topic_group = topic_group
         content.style_key = style_key
         content.franchise_key = franchise_key
@@ -2296,16 +2351,21 @@ class ContentDiscoveryEngine:
                 self._EVALUATE_BATCH_HARD_CAP,
                 source_context or "mixed",
             )
+            for overflow in contents[self._EVALUATE_BATCH_HARD_CAP :]:
+                overflow.score_source = SCORE_SOURCE_TRUNCATED
+                overflow.llm_score_raw = None
             contents = contents[: self._EVALUATE_BATCH_HARD_CAP]
 
         scores: list[float] = [0.0] * len(contents)
         viewed_content_keys = self._recent_viewed_content_keys()
         if viewed_content_keys:
-            eval_pairs = [
-                (index, content)
-                for index, content in enumerate(contents)
-                if self._candidate_view_keys(content).isdisjoint(viewed_content_keys)
-            ]
+            eval_pairs = []
+            for index, content in enumerate(contents):
+                if self._candidate_view_keys(content).isdisjoint(viewed_content_keys):
+                    eval_pairs.append((index, content))
+                else:
+                    content.score_source = SCORE_SOURCE_VIEWED
+                    content.llm_score_raw = None
             skipped_viewed = len(contents) - len(eval_pairs)
             if skipped_viewed > 0:
                 logger.info(
@@ -2375,7 +2435,7 @@ class ContentDiscoveryEngine:
                 # The cache tuple grew first to carry franchise_key and now
                 # temporal semantics. Keep both legacy 4/5-field shapes safe
                 # for in-flight processes during a rolling upgrade.
-                score, reason, topic_group, style_key, franchise_key, temporal = (
+                score, reason, topic_group, style_key, franchise_key, temporal, score_source = (
                     _decode_eval_cache_entry(cached)
                 )
                 normalized_reason = normalize_evaluation_reason(score, reason)
@@ -2385,6 +2445,8 @@ class ContentDiscoveryEngine:
                 style_key = normalize_style_key(style_key)
                 content.relevance_score = score
                 content.relevance_reason = normalized_reason
+                content.score_source = score_source
+                content.llm_score_raw = score if score_source == SCORE_SOURCE_LLM else None
                 content.topic_group = topic_group
                 content.style_key = style_key
                 content.franchise_key = franchise_key
@@ -2483,6 +2545,8 @@ class ContentDiscoveryEngine:
                             )
                             or ""
                         )
+                        content.score_source = SCORE_SOURCE_PREFILTER
+                        content.llm_score_raw = None
                         content.topic_group = ""
                         content.style_key = ""
                         content.franchise_key = ""
@@ -3476,6 +3540,8 @@ class ContentDiscoveryEngine:
 
             content.relevance_score = score
             content.relevance_reason = reason
+            content.score_source = SCORE_SOURCE_LLM
+            content.llm_score_raw = score
             content.topic_group = topic_group
             content.style_key = style_key
             content.franchise_key = franchise_key
@@ -3542,9 +3608,18 @@ class ContentDiscoveryEngine:
                 # Keep top ``cap`` by score, drop the rest.
                 indices.sort(key=lambda idx: results[idx] or 0.0, reverse=True)
                 for idx in indices[cap:]:
+                    content = batch[idx]
+                    # The teacher judgment is preserved in ``llm_score_raw``:
+                    # the cap is a deterministic pool-diversity rule, and a
+                    # distilled model must not learn it as a content signal.
+                    raw_score = float(results[idx] or 0.0)
+                    content.llm_score_raw = (
+                        raw_score if content.score_source == SCORE_SOURCE_LLM else None
+                    )
+                    content.score_source = SCORE_SOURCE_CAP_FRANCHISE
                     results[idx] = 0.0
-                    batch[idx].relevance_score = 0.0
-                    batch[idx].relevance_reason = ""
+                    content.relevance_score = 0.0
+                    content.relevance_reason = ""
                     dropped += 1
             if dropped:
                 logger.info(
@@ -3579,9 +3654,15 @@ class ContentDiscoveryEngine:
                     continue
                 indices.sort(key=lambda idx: results[idx] or 0.0, reverse=True)
                 for idx in indices[style_cap:]:
+                    content = batch[idx]
+                    raw_score = float(results[idx] or 0.0)
+                    content.llm_score_raw = (
+                        raw_score if content.score_source == SCORE_SOURCE_LLM else None
+                    )
+                    content.score_source = SCORE_SOURCE_CAP_STYLE
                     results[idx] = 0.0
-                    batch[idx].relevance_score = 0.0
-                    batch[idx].relevance_reason = ""
+                    content.relevance_score = 0.0
+                    content.relevance_reason = ""
                     style_dropped += 1
             if style_dropped:
                 logger.info(
@@ -3659,6 +3740,8 @@ class ContentDiscoveryEngine:
         for index, (content, score) in enumerate(zip(batch, results, strict=True)):
             if score is None:
                 content.relevance_reason = "evaluation_response_missing"
+                content.score_source = SCORE_SOURCE_RESPONSE_MISSING
+                content.llm_score_raw = None
                 final.append(0.0)
             else:
                 if valid_score_indices is not None:

@@ -999,6 +999,12 @@ class DiscoveryCandidatePipeline:
                     "status": status,
                     "relevance_score": final_score,
                     "relevance_reason": item.relevance_reason,
+                    # Score provenance (ml-ranking Wave 0): ``llm_score_raw`` is
+                    # the teacher judgment to distill on; ``score_source``
+                    # explains how ``relevance_score`` came to be (see the
+                    # SCORE_SOURCE_* taxonomy in discovery.engine).
+                    "score_source": item.score_source,
+                    "llm_score_raw": item.llm_score_raw,
                     "temporal_class": item.temporal_class,
                     "temporal_confidence": item.temporal_confidence,
                     "temporal_reason": item.temporal_reason,

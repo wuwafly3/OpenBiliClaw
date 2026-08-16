@@ -11,8 +11,13 @@
 2. `ranking_feature_log` 表 + 写入点（serve 时 top-K 与淘汰各一行），
    隐私安全字段集，30 天保留，沿用 `record_prefilter_shadow_decisions` 的形状。
 3. `scripts/export_ranking_dataset.py`：把 `discovery_candidates`
-   （`cached` + `rejected_low_score`）未截断 (特征, 分数) 导出为版本化数据集，
+   未截断 (特征, 分数) 导出为版本化数据集，
    二分类标签按 S1.1 规则在导出时计算并冻结，脱离 30 天保留期。
+   **分数溯源已落地（S0.3a）**：`discovery_candidates` 新增 `score_source` /
+   `llm_score_raw` 两列（cap 置零前的教师原始分被保留）；导出必须走
+   `Database.get_teacher_labeled_discovery_candidates()` 的教师判定白名单，
+   标签取 `llm_score_raw`，不得直接 `SELECT relevance_score`（cap 置零行的
+   `relevance_score = 0.0` 是配额产物，直接用会产出假负样本）。
 4. 冻结 `engagement_label` 定义（spec 附录 A）并实现纯函数 + 单测。
 5. 采集真实使用数据；负样本 ≥ 300 条方可进 Wave 1 训练。
 
@@ -70,5 +75,6 @@
 - **人类正样本约 50 条**（like 16 + favorite 关联部分）→ 低于 Wave 2 门槛 200，
   采集进行中。
 - **教师分对 like/dislike 的 AUC = 0.4513** → Wave 1 只声称成本，不声称质量。
-- **Wave 1 训练集 = 578 行**（`discovery_candidates` cached 330 + rejected 248），
-  未截断；来源表 30 天滚动保留 → Wave 0 第 3 步必须先导出固化。
+- **Wave 1 训练集 ≈ 686 行**（教师判定白名单：非零教师分 599 + shadow_audit
+  恢复的 cap 置零真阳性 87；S0.3a 溯源已落地），未截断；来源表 30 天滚动保留
+  → Wave 0 第 3 步必须先导出固化。

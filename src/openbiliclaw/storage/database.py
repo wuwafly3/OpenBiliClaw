@@ -46,6 +46,7 @@ from openbiliclaw.discovery.prefilter_audit import (
     PREFILTER_AUDIT_RETENTION_DAYS,
     validate_prefilter_storage_record,
 )
+from openbiliclaw.discovery.score_source import LLM_JUDGMENT_SCORE_SOURCES
 from openbiliclaw.discovery.temporal import (
     PUBLICATION_CLOCK_SKEW_TOLERANCE,
     TEMPORAL_CONFIDENCE_FULL,
@@ -1143,6 +1144,14 @@ CREATE TABLE IF NOT EXISTS discovery_candidates (
     franchise_key         TEXT NOT NULL DEFAULT '',
     relevance_score       REAL NOT NULL DEFAULT 0.0,
     relevance_reason      TEXT NOT NULL DEFAULT '',
+    -- Score provenance (ml-ranking Wave 0). ``score_source`` follows the
+    -- SCORE_SOURCE_* taxonomy in discovery.engine: 'llm'/'cap_franchise'/
+    -- 'cap_style' mean the teacher judged the item ('' = pre-taxonomy row);
+    -- every other value marks a deterministically zeroed/synthesized score.
+    -- ``llm_score_raw`` preserves the teacher score before cap zeroing so
+    -- distillation training data survives the diversity caps.
+    score_source          TEXT NOT NULL DEFAULT '',
+    llm_score_raw         REAL,
     temporal_class        TEXT NOT NULL DEFAULT 'unknown',
     temporal_confidence   REAL NOT NULL DEFAULT 0.0,
     temporal_reason       TEXT NOT NULL DEFAULT '',
@@ -6387,6 +6396,8 @@ class Database:
                             franchise_key = ?,
                             relevance_score = ?,
                             relevance_reason = ?,
+                            score_source = ?,
+                            llm_score_raw = ?,
                             temporal_class = ?,
                             temporal_confidence = ?,
                             temporal_reason = ?,
@@ -6424,6 +6435,12 @@ class Database:
                             ),
                             str(
                                 evaluation.get("relevance_reason") or evaluation.get("reason") or ""
+                            ),
+                            str(evaluation.get("score_source") or ""),
+                            (
+                                float(raw)
+                                if (raw := evaluation.get("llm_score_raw")) is not None
+                                else None
                             ),
                             temporal[0],
                             temporal[1],
@@ -6741,6 +6758,46 @@ class Database:
             (str(reason), int(candidate_id)),
         )
         return int(cursor.rowcount)
+
+    def get_teacher_labeled_discovery_candidates(self) -> list[dict[str, Any]]:
+        """Return candidate rows whose score is a genuine LLM judgment.
+
+        Single allowlist for the ml-ranking distillation dataset (Wave 0,
+        ``scripts/export_ranking_dataset.py``): only rows stamped with an
+        LLM-judgment ``score_source`` and a non-NULL ``llm_score_raw`` may
+        enter the teacher-label export. Cap-zeroed rows carry their pre-cap
+        judgment in ``llm_score_raw``; prefilter/viewed/error rows and
+        pre-taxonomy rows (``score_source = ''``) are excluded — their
+        ``relevance_score`` is not a teacher signal.
+        """
+
+        placeholders = ", ".join("?" for _ in LLM_JUDGMENT_SCORE_SOURCES)
+        self._ensure_fresh_read()
+        cursor = self.conn.execute(
+            f"""
+            SELECT id, candidate_key, source_platform, source_strategy,
+                   source_context, content_type, title, body_text,
+                   bvid, content_id, content_url, author_name, up_mid,
+                   description, published_at, duration,
+                   view_count, like_count, favorite_count, collect_count,
+                   comment_count, share_count, danmaku_count, reply_count,
+                   retweet_count, bookmark_count,
+                   rating_score, rating_count, source_rank, tags,
+                   candidate_tier, score_threshold,
+                   topic_key, topic_group, style_key, franchise_key,
+                   relevance_score, relevance_reason, score_source, llm_score_raw,
+                   temporal_class, temporal_confidence,
+                   temporal_validity_mode, temporal_valid_until,
+                   temporal_scope, temporal_state,
+                   status, eval_error, evaluated_at
+            FROM discovery_candidates
+            WHERE score_source IN ({placeholders})
+              AND llm_score_raw IS NOT NULL
+            ORDER BY evaluated_at ASC, id ASC
+            """,
+            tuple(sorted(LLM_JUDGMENT_SCORE_SOURCES)),
+        )
+        return [dict(row) for row in cursor.fetchall()]
 
     def count_discovery_candidates_by_status(self) -> dict[str, int]:
         """Return lifecycle totals plus the currently claimable pending count."""
@@ -13529,6 +13586,12 @@ class Database:
             "temporal_evidence_complete": "INTEGER NOT NULL DEFAULT 0",
             "temporal_review_attempts": "INTEGER NOT NULL DEFAULT 0",
             "temporal_review_retry_at": "TEXT NOT NULL DEFAULT ''",
+            # Score provenance (ml-ranking Wave 0): '' on legacy rows means
+            # unknown origin — excluded from teacher-label exports rather
+            # than guessed. ``llm_score_raw`` is nullable by design (no
+            # teacher judgment exists for zeroed/synthesized scores).
+            "score_source": "TEXT NOT NULL DEFAULT ''",
+            "llm_score_raw": "REAL",
         }
         for column_name, column_type in required_columns.items():
             if column_name in existing_columns:
