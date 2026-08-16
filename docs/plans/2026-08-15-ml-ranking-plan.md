@@ -18,6 +18,10 @@
    `Database.get_teacher_labeled_discovery_candidates()` 的教师判定白名单，
    标签取 `llm_score_raw`，不得直接 `SELECT relevance_score`（cap 置零行的
    `relevance_score = 0.0` 是配额产物，直接用会产出假负样本）。
+   导出时记录批身份（`evaluated_at` 聚簇即批，分组分析与不确定带研究依赖它），
+   并经 embedding 服务补算候选文本向量降维投影（≤32 维 PCA/随机投影）入
+   数据集——embedding LRU 缓存对历史候选命中率仅 12%，不可作数据源
+   （pairwise 原型实测）。
 4. 冻结 `engagement_label` 定义（spec 附录 A）并实现纯函数 + 单测。
 5. 采集真实使用数据；负样本 ≥ 300 条方可进 Wave 1 训练。
 
@@ -25,7 +29,9 @@
 
 ## Wave 1 — 准入二分类蒸馏（成本项）
 
-1. `ml/features.py`：确定性纯函数特征提取（spec S1.2 特征集），
+1. `ml/features.py`：确定性纯函数特征提取（spec S1.2 特征集，
+   含候选文本向量降维投影 ≤32 维——pairwise 原型实测当前特征集的教师
+   排序复现上限 ρ≈0.46 / 准入 AUC≈0.72–0.80，文本向量本体是下一特征杠杆），
    输入 `DiscoveredContent` + 画像视图，输出定长 numpy 向量 + 特征名清单。
    **禁** `topic_group` / `style_key` / `franchise_key` / `temporal_*`（标签泄漏；
    多任务原型证实自预测 tags 只能挽回该信息约 4% 增量，两阶段辅助头方案
@@ -43,6 +49,8 @@
 8. 阈值重标定 **C1–C7 全部 7 个常数**（§3.1）：准入线按 FPR/FNR 权衡选点，
    delight/通知/tier 取同分位，注释写标定溯源与分位数对齐证据。
 9. LLM 保留调用集定义（y=1 候选 + 不确定带 + 校准集）落地为代码常量 + 注释。
+   概率校准（Brier 门槛）用 isotonic——pairwise 原型已验证该形式可用
+   （`docs/plans/2026-08-16-ml-pairwise-probe.md`）。
 
 **门:** S1.5 六项全过（含分平台分层）；`discovery.evaluate_batch` token ≤ 基线 70%。
 

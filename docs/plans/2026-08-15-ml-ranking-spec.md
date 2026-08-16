@@ -275,6 +275,10 @@ y = 0  otherwise
 
 **S1.2** 特征集只用评估时刻已有、零额外网络成本的量：
 profile↔候选文本余弦（含 max/mean 与可用性掩码）、profile↔封面余弦（多模态开启时）、
+**候选文本向量的降维投影（≤32 维 PCA / 随机投影；评估时 embedding 已计算，
+零额外网络成本——原型实测：仅用聚合相似度时教师批内排序只能复现
+~0.4，文本向量本体是下一特征杠杆，见
+`docs/plans/2026-08-16-ml-pairwise-probe.md`）**、
 互动计数的对数与 `engagement_available` 掩码、时长、发布年龄、文本长度统计、
 `source_platform` / `source_strategy` / `content_type` one-hot、
 `rating_score` / `rating_count` / `source_rank`。
@@ -287,10 +291,17 @@ profile↔候选文本余弦（含 max/mean 与可用性掩码）、profile↔�
 **S1.3** 模型形态：离线训练（`[ml]` 可选依赖），运行时**纯 numpy 推理**，
 权重以版本化 artifact 落盘。686 行样本（S0.3a 溯源白名单口径）只支持带强正则的浅模型
 （logistic / 浅 GBDT），不支持深网。运行时不新增 sklearn / lightgbm 依赖 ——
-local-first 桌面分发不接受为推理引入训练框架。
+local-first 桌面分发不接受为推理引入训练框架（纯 numpy 前向/反向/Adam 训练器
+原型已验证可行，见 `docs/plans/2026-08-16-ml-pairwise-probe.md`）。
+概率校准用 isotonic 回归（artifact 携带映射表，同实验验证）。
 
 **S1.4** 门控：`[discovery].relevance_scorer = "llm" | "shadow" | "ml"`，
 默认 `llm`。`shadow` 下 ML 与 LLM 同时判定、只记录分歧，不影响准入。
+可行性基线（2026-08-16 实测，同特征集）：logistic AUC 0.724±0.066
+（profile_digest 分组切分）/ 0.799±0.028（分层切分），Brier 0.206——
+当前特征集距 S1.5 门槛有结构性差距，瓶颈在特征表达力而非建模形态
+（pairwise 原型：教师批内排序复现上限 ρ≈0.46）。**文本向量投影与
+廉价标签通道（S1.2a）落地并实测逼近门槛前，不得离开 `shadow`**。
 
 **S1.5 二分类门槛**（`shadow` 转 `ml` 的硬条件，全部满足才可切）：
 
