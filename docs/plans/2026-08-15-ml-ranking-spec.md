@@ -234,7 +234,11 @@ S0.3a 溯源白名单的 `llm_score_raw`），导出即冻结，不做二次打�
 `llm_score_raw IS NOT NULL` 的行，统一走
 `Database.get_teacher_labeled_discovery_candidates()`，标签取 `llm_score_raw`
 （cap 行的 `relevance_score` 已被置零，不可用作标签）。`content_cache` 行天然
-全部是过准入门的教师分，不受此问题影响。
+全部是过准入门的教师分，不受此问题影响。同段落地的还有 `teacher_model`
+列：每行记录实际应答的 LLM 身份（`provider/model`，取自响应对象）——
+**固定教师（deepseek-v4-flash）采集期间按此列筛训练集**，非本教师的
+历史行不得进入该教师的门槛拟合；provider 回退换模型的行也会被如实
+标记而非静默混入。
 
 **S0.4 隐式标签定义**：把 `watch_seconds` / `page_dwell_seconds` / `favorite` /
 `like` / `dislike` 归一成单一 `engagement_label`，定义写进本 spec 附录并冻结。

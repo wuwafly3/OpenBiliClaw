@@ -153,6 +153,30 @@ _EvalCacheEntryV6 = tuple[
     bool,
     str,
 ]
+# v7 appends ``teacher_model`` so cache-hit rows keep the identity of the
+# LLM that actually produced the cached judgment (in-memory cache lives in
+# one process, but the stamp must survive the round trip anyway).
+_EvalCacheEntryV7 = tuple[
+    float,
+    str,
+    str,
+    str,
+    str,
+    str,
+    float,
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    bool,
+    str,
+    str,
+]
 _EvalCacheEntry = (
     tuple[float, str, str, str]
     | tuple[float, str, str, str, str]
@@ -160,6 +184,7 @@ _EvalCacheEntry = (
     | _EvalCacheEntryV5Legacy
     | _EvalCacheEntryV5
     | _EvalCacheEntryV6
+    | _EvalCacheEntryV7
 )
 _BILIBILI_CONTENT_ID_PATTERN = re.compile(r"^BV[0-9A-Za-z]+$")
 _CANONICAL_STORAGE_KEY_PLATFORMS = frozenset(
@@ -496,13 +521,29 @@ def _apply_temporal_evaluation(
     content.temporal_evaluated = temporal.evidence_complete and temporal.temporal_class != "unknown"
 
 
+def _response_teacher_identity(response: object) -> str:
+    """Best-effort "provider/model" identity of the LLM that answered.
+
+    Stamped per evaluation row so a fixed-teacher collection window stays
+    auditable even when a provider fallback silently routed the call to a
+    different model. Returns "" when the response object carries no identity
+    (test doubles, exotic adapters).
+    """
+
+    provider = str(getattr(response, "provider", "") or "")
+    model = str(getattr(response, "model", "") or "")
+    if provider and model:
+        return f"{provider}/{model}"
+    return model or provider
+
+
 def _decode_eval_cache_entry(
     cached: _EvalCacheEntry,
-) -> tuple[float, str, str, str, str, TemporalEvaluation, str]:
+) -> tuple[float, str, str, str, str, TemporalEvaluation, str, str]:
     """Decode evaluator cache tuples and legacy 4/5/9-field entries.
 
-    Returns the provenance (``score_source``) as the final element; legacy
-    tuples predate the taxonomy and only ever held raw LLM results.
+    Returns ``score_source`` then ``teacher_model`` as the final elements;
+    legacy tuples predate both stamps and only ever held raw LLM results.
     """
 
     score, reason, topic_group, style_key = cached[:4]
@@ -510,6 +551,7 @@ def _decode_eval_cache_entry(
     score_source = SCORE_SOURCE_LLM
     if len(cached) >= 18:
         score_source = cast("_EvalCacheEntryV6", cached)[17]
+    teacher_model = cast("_EvalCacheEntryV7", cached)[18] if len(cached) >= 19 else ""
     temporal = TemporalEvaluation()
     if len(cached) >= 17:
         cached_v5 = cast("_EvalCacheEntryV5", cached)
@@ -550,13 +592,22 @@ def _decode_eval_cache_entry(
             temporal_reason=cached_v4[7],
             temporal_policy_version=cached_v4[8],
         )
-    return score, reason, topic_group, style_key, franchise_key, temporal, score_source
+    return (
+        score,
+        reason,
+        topic_group,
+        style_key,
+        franchise_key,
+        temporal,
+        score_source,
+        teacher_model,
+    )
 
 
 def _eval_cache_entry_for_content(
     content: DiscoveredContent,
-) -> _EvalCacheEntryV6:
-    """Build the v6 in-memory cache shape from an evaluated candidate."""
+) -> _EvalCacheEntryV7:
+    """Build the v7 in-memory cache shape from an evaluated candidate."""
 
     return (
         content.relevance_score,
@@ -577,6 +628,7 @@ def _eval_cache_entry_for_content(
         content.temporal_evaluated_at,
         content.temporal_evidence_complete,
         content.score_source or SCORE_SOURCE_LLM,
+        content.teacher_model,
     )
 
 
@@ -830,6 +882,12 @@ class DiscoveredContent:
     # enter the teacher-label dataset.
     score_source: str = ""
     llm_score_raw: float | None = None  # Teacher judgment before cap zeroing
+    # Identity of the LLM that actually produced this judgment
+    # ("provider/model", from the response object — covers provider fallback).
+    # Empty when no LLM judged the item. Lets a fixed-teacher data collection
+    # window stay auditable; mixing teachers is a real variance source
+    # (measured batch drift std 0.114 ≈ within-batch 0.137).
+    teacher_model: str = ""
     temporal_class: str = "unknown"  # Why this content's value may expire
     temporal_confidence: float = 0.0  # Evaluator confidence in temporal_class
     temporal_reason: str = ""  # Short diagnostic for the temporal classification
@@ -2134,15 +2192,23 @@ class ContentDiscoveryEngine:
         )
         cached = self._get_eval_cache_entry(cache_key)
         if cached is not None:
-            score, reason, topic_group, style_key, franchise_key, temporal, score_source = (
-                _decode_eval_cache_entry(cached)
-            )
+            (
+                score,
+                reason,
+                topic_group,
+                style_key,
+                franchise_key,
+                temporal,
+                score_source,
+                teacher_model,
+            ) = _decode_eval_cache_entry(cached)
             normalized_reason = normalize_evaluation_reason(score, reason)
             if normalized_reason is not None:
                 content.relevance_score = score
                 content.relevance_reason = normalized_reason
                 content.score_source = score_source
                 content.llm_score_raw = score if score_source == SCORE_SOURCE_LLM else None
+                content.teacher_model = teacher_model
                 content.topic_group = topic_group
                 content.style_key = normalize_style_key(style_key)
                 content.franchise_key = franchise_key
@@ -2233,6 +2299,7 @@ class ContentDiscoveryEngine:
                 response = await self._concurrency.run_llm(llm_call)
             else:
                 response = await llm_call
+            teacher_model = _response_teacher_identity(response)
             payload = parse_llm_json_tolerant(str(getattr(response, "content", "")).strip())
             if not isinstance(payload, dict):
                 raise ValueError("Expected JSON object from content evaluation")
@@ -2265,12 +2332,14 @@ class ContentDiscoveryEngine:
             logger.exception("Failed to evaluate discovered content: %s", content.bvid)
             content.score_source = SCORE_SOURCE_EVAL_ERROR
             content.llm_score_raw = None
+            content.teacher_model = ""
             return 0.0
 
         content.relevance_score = score
         content.relevance_reason = reason
         content.score_source = SCORE_SOURCE_LLM
         content.llm_score_raw = score
+        content.teacher_model = teacher_model
         content.topic_group = topic_group
         content.style_key = style_key
         content.franchise_key = franchise_key
@@ -2354,6 +2423,7 @@ class ContentDiscoveryEngine:
             for overflow in contents[self._EVALUATE_BATCH_HARD_CAP :]:
                 overflow.score_source = SCORE_SOURCE_TRUNCATED
                 overflow.llm_score_raw = None
+                overflow.teacher_model = ""
             contents = contents[: self._EVALUATE_BATCH_HARD_CAP]
 
         scores: list[float] = [0.0] * len(contents)
@@ -2366,6 +2436,7 @@ class ContentDiscoveryEngine:
                 else:
                     content.score_source = SCORE_SOURCE_VIEWED
                     content.llm_score_raw = None
+                    content.teacher_model = ""
             skipped_viewed = len(contents) - len(eval_pairs)
             if skipped_viewed > 0:
                 logger.info(
@@ -2435,9 +2506,16 @@ class ContentDiscoveryEngine:
                 # The cache tuple grew first to carry franchise_key and now
                 # temporal semantics. Keep both legacy 4/5-field shapes safe
                 # for in-flight processes during a rolling upgrade.
-                score, reason, topic_group, style_key, franchise_key, temporal, score_source = (
-                    _decode_eval_cache_entry(cached)
-                )
+                (
+                    score,
+                    reason,
+                    topic_group,
+                    style_key,
+                    franchise_key,
+                    temporal,
+                    score_source,
+                    teacher_model,
+                ) = _decode_eval_cache_entry(cached)
                 normalized_reason = normalize_evaluation_reason(score, reason)
                 if normalized_reason is None:
                     uncached_indices.append(i)
@@ -2447,6 +2525,7 @@ class ContentDiscoveryEngine:
                 content.relevance_reason = normalized_reason
                 content.score_source = score_source
                 content.llm_score_raw = score if score_source == SCORE_SOURCE_LLM else None
+                content.teacher_model = teacher_model
                 content.topic_group = topic_group
                 content.style_key = style_key
                 content.franchise_key = franchise_key
@@ -2547,6 +2626,7 @@ class ContentDiscoveryEngine:
                         )
                         content.score_source = SCORE_SOURCE_PREFILTER
                         content.llm_score_raw = None
+                        content.teacher_model = ""
                         content.topic_group = ""
                         content.style_key = ""
                         content.franchise_key = ""
@@ -3463,6 +3543,7 @@ class ContentDiscoveryEngine:
             raise
 
         raw = str(getattr(response, "content", "")).strip()
+        teacher_model = _response_teacher_identity(response)
         payload = _parse_batch_evaluation_payload(raw)
         if payload is None:
             return [None] * len(batch)
@@ -3542,6 +3623,7 @@ class ContentDiscoveryEngine:
             content.relevance_reason = reason
             content.score_source = SCORE_SOURCE_LLM
             content.llm_score_raw = score
+            content.teacher_model = teacher_model
             content.topic_group = topic_group
             content.style_key = style_key
             content.franchise_key = franchise_key
@@ -3742,6 +3824,7 @@ class ContentDiscoveryEngine:
                 content.relevance_reason = "evaluation_response_missing"
                 content.score_source = SCORE_SOURCE_RESPONSE_MISSING
                 content.llm_score_raw = None
+                content.teacher_model = ""
                 final.append(0.0)
             else:
                 if valid_score_indices is not None:

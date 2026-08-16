@@ -5501,7 +5501,7 @@ async def test_single_evaluation_parses_and_caches_temporal_metadata() -> None:
         assert item.temporal_evidence_complete is True
         assert item.temporal_evaluated is True
     assert len(llm.calls) == 1
-    assert {len(entry) for entry in engine._eval_cache.values()} == {18}
+    assert {len(entry) for entry in engine._eval_cache.values()} == {19}
     assert {entry[8] for entry in engine._eval_cache.values()} == {"v2"}
 
 

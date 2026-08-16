@@ -1002,9 +1002,13 @@ class DiscoveryCandidatePipeline:
                     # Score provenance (ml-ranking Wave 0): ``llm_score_raw`` is
                     # the teacher judgment to distill on; ``score_source``
                     # explains how ``relevance_score`` came to be (see the
-                    # SCORE_SOURCE_* taxonomy in discovery.engine).
+                    # SCORE_SOURCE_* taxonomy in discovery.engine);
+                    # ``teacher_model`` identifies the LLM that actually
+                    # judged the item (provider/model, from the response —
+                    # covers silent provider fallback during collection).
                     "score_source": item.score_source,
                     "llm_score_raw": item.llm_score_raw,
+                    "teacher_model": item.teacher_model,
                     "temporal_class": item.temporal_class,
                     "temporal_confidence": item.temporal_confidence,
                     "temporal_reason": item.temporal_reason,

@@ -1152,6 +1152,10 @@ CREATE TABLE IF NOT EXISTS discovery_candidates (
     -- distillation training data survives the diversity caps.
     score_source          TEXT NOT NULL DEFAULT '',
     llm_score_raw         REAL,
+    -- Teacher identity ("provider/model") for the LLM judgment, from the
+    -- actual response object — a fixed-teacher collection window stays
+    -- auditable even when provider fallback reroutes a call.
+    teacher_model         TEXT NOT NULL DEFAULT '',
     temporal_class        TEXT NOT NULL DEFAULT 'unknown',
     temporal_confidence   REAL NOT NULL DEFAULT 0.0,
     temporal_reason       TEXT NOT NULL DEFAULT '',
@@ -6398,6 +6402,7 @@ class Database:
                             relevance_reason = ?,
                             score_source = ?,
                             llm_score_raw = ?,
+                            teacher_model = ?,
                             temporal_class = ?,
                             temporal_confidence = ?,
                             temporal_reason = ?,
@@ -6442,6 +6447,7 @@ class Database:
                                 if (raw := evaluation.get("llm_score_raw")) is not None
                                 else None
                             ),
+                            str(evaluation.get("teacher_model") or ""),
                             temporal[0],
                             temporal[1],
                             temporal[2],
@@ -6786,6 +6792,7 @@ class Database:
                    candidate_tier, score_threshold,
                    topic_key, topic_group, style_key, franchise_key,
                    relevance_score, relevance_reason, score_source, llm_score_raw,
+                   teacher_model,
                    temporal_class, temporal_confidence,
                    temporal_validity_mode, temporal_valid_until,
                    temporal_scope, temporal_state,
@@ -13592,6 +13599,7 @@ class Database:
             # teacher judgment exists for zeroed/synthesized scores).
             "score_source": "TEXT NOT NULL DEFAULT ''",
             "llm_score_raw": "REAL",
+            "teacher_model": "TEXT NOT NULL DEFAULT ''",
         }
         for column_name, column_type in required_columns.items():
             if column_name in existing_columns:

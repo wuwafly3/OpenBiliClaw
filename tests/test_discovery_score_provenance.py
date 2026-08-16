@@ -11,6 +11,7 @@ teacher-only read allowlist.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import pytest
@@ -299,6 +300,7 @@ def _evaluation(
     score_source: str,
     llm_score_raw: float | None,
     relevance_score: float = 0.0,
+    teacher_model: str = "",
 ) -> dict[str, object]:
     return {
         "candidate_id": candidate_id,
@@ -307,6 +309,7 @@ def _evaluation(
         "relevance_reason": "",
         "score_source": score_source,
         "llm_score_raw": llm_score_raw,
+        "teacher_model": teacher_model,
         "temporal_class": "unknown",
         "temporal_confidence": 0.0,
         "temporal_policy_version": "v1",
@@ -390,3 +393,129 @@ def test_llm_judgment_allowlist_covers_caps_but_not_synthetic_sources() -> None:
         "",
     ):
         assert synthetic not in LLM_JUDGMENT_SCORE_SOURCES
+
+
+@dataclass
+class _StampedResponse:
+    content: str
+    model: str = ""
+    provider: str = ""
+
+
+class _ModelStampedBatchLLMService(_VariedStyleBatchLLMService):
+    """Echoes the per-call teacher identity like a real LLMResponse does."""
+
+    async def complete_structured_task(
+        self,
+        *,
+        system_instruction: str,
+        user_input: str,
+        **kwargs: object,
+    ) -> object:
+        plain = await super().complete_structured_task(
+            system_instruction=system_instruction, user_input=user_input, **kwargs
+        )
+        assert isinstance(plain, _SlowResponse)
+        return _StampedResponse(
+            content=plain.content,
+            model="deepseek-v4-flash",
+            provider="deepseek",
+        )
+
+
+@pytest.mark.asyncio
+async def test_batch_llm_scores_stamp_teacher_model_identity() -> None:
+    engine = ContentDiscoveryEngine(llm_service=_ModelStampedBatchLLMService())
+    contents = [
+        DiscoveredContent(
+            bvid=f"BV_PROV_MODEL_{index}", title=f"候选 {index}", source_strategy="search"
+        )
+        for index in range(3)
+    ]
+
+    await engine.evaluate_content_batch(contents, _build_profile())
+
+    for content in contents:
+        assert content.score_source == "llm"
+        assert content.teacher_model == "deepseek/deepseek-v4-flash"
+
+
+@pytest.mark.asyncio
+async def test_response_without_identity_stamps_empty_teacher_model() -> None:
+    engine = ContentDiscoveryEngine(llm_service=_VariedStyleBatchLLMService())
+    contents = [DiscoveredContent(bvid="BV_PROV_NOMODEL", title="候选", source_strategy="search")]
+
+    await engine.evaluate_content_batch(contents, _build_profile())
+
+    assert contents[0].score_source == "llm"
+    assert contents[0].teacher_model == ""
+
+
+@pytest.mark.asyncio
+async def test_non_teacher_paths_leave_teacher_model_empty(tmp_path: Path) -> None:
+    low_text = "不相关内容 厨房技巧"
+    database = Database(tmp_path / "teacher-model-prefilter.db")
+    database.initialize()
+    engine = ContentDiscoveryEngine(
+        llm_service=_ModelStampedBatchLLMService(),
+        database=database,
+        embedding_service=_CountingEmbeddingService(_prefilter_vectors(low_texts=[low_text])),
+        eval_prefilter_mode="enforce",
+    )
+    filtered = DiscoveredContent(
+        bvid="BV_PROV_MODEL_FILTER",
+        title="不相关内容",
+        description="厨房技巧",
+        source_strategy="trending",
+    )
+    viewed_db = _RecentViewedDatabase({"BV_PROV_MODEL_VIEWED"})
+    viewed_engine = ContentDiscoveryEngine(
+        llm_service=_ModelStampedBatchLLMService(),
+        database=viewed_db,  # type: ignore[arg-type]
+    )
+    viewed = DiscoveredContent(
+        bvid="BV_PROV_MODEL_VIEWED", title="已经看过", source_strategy="trending"
+    )
+
+    await engine.evaluate_content_batch([filtered], _build_profile(), batch_size=1)
+    await viewed_engine.evaluate_content_batch(
+        [
+            viewed,
+            DiscoveredContent(
+                bvid="BV_PROV_MODEL_FRESH", title="新内容", source_strategy="trending"
+            ),
+        ],
+        _build_profile(),
+    )
+
+    assert filtered.score_source == "prefilter"
+    assert filtered.teacher_model == ""
+    assert viewed.score_source == "viewed"
+    assert viewed.teacher_model == ""
+
+
+def test_evaluation_persist_round_trips_teacher_model(tmp_path: Path) -> None:
+    database = Database(tmp_path / "teacher-model-roundtrip.db")
+    database.initialize()
+    candidate_id = _enqueue_and_claim(database, "BV_PROV_TEACHER")
+
+    updated = database.update_discovery_candidate_evaluations(
+        [
+            _evaluation(
+                candidate_id,
+                score_source="llm",
+                llm_score_raw=0.77,
+                teacher_model="deepseek/deepseek-v4-flash",
+            )
+        ]
+    )
+    assert updated == 1
+
+    row = database.conn.execute(
+        "SELECT score_source, llm_score_raw, teacher_model FROM discovery_candidates WHERE id = ?",
+        (candidate_id,),
+    ).fetchone()
+    assert row["teacher_model"] == "deepseek/deepseek-v4-flash"
+
+    teacher_rows = database.get_teacher_labeled_discovery_candidates()
+    assert teacher_rows[0]["teacher_model"] == "deepseek/deepseek-v4-flash"
