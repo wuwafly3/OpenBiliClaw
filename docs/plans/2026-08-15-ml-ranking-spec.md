@@ -216,8 +216,11 @@ top-K 与被淘汰的候选各记录一行：请求内 rank、模型分、教师
 `evaluator_prefilter_shadow_audit` 的隐私安全先例）。对二分类（§2.7）而言，
 这是阶段 2 学习排序的特征来源，阶段 1 训练**不依赖**它。
 
-**S0.3 教师标签快照固化**：把 `discovery_candidates`
-未截断 (特征, 分数) 对导出为版本化数据集文件，脱离 30 天保留期。
+**S0.3 教师标签快照固化**（✅ 初版已落地：
+`scripts/export_ranking_dataset.py`——legacy 恢复策略 + 全量 shadow_audit
+快照 + 冻结二分类标签；深度学习用特征工程版随 Wave 1 特征定稿扩展）：
+把 `discovery_candidates` 未截断 (特征, 分数) 对导出为版本化数据集文件，
+脱离 30 天保留期。
 二分类标签在导出时按 S1.1 规则计算
 （`teacher_score >= effective_admission_threshold`，`teacher_score` 取
 S0.3a 溯源白名单的 `llm_score_raw`），导出即冻结，不做二次打标。

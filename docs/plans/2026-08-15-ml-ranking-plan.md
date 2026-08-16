@@ -10,8 +10,11 @@
    四面写入（插件 / desktop web / mobile web / CLI），与 `presented` 严格分离。
 2. `ranking_feature_log` 表 + 写入点（serve 时 top-K 与淘汰各一行），
    隐私安全字段集，30 天保留，沿用 `record_prefilter_shadow_decisions` 的形状。
-3. `scripts/export_ranking_dataset.py`：把 `discovery_candidates`
-   未截断 (特征, 分数) 导出为版本化数据集，
+3. ✅（初版已落地）`scripts/export_ranking_dataset.py`：把
+   `discovery_candidates` 未截断 (特征, 分数) 导出为版本化数据集，
+   含 legacy 恢复策略（非零即教师分 / 零分行从 audit 恢复 / 歧义丢弃）、
+   全量 shadow_audit 快照（30 天硬删除，导出要趁早）、冻结二分类标签
+   与 `teacher_model` 分组统计；embedding 向量补算随 Wave 1 特征定稿加入。
    二分类标签按 S1.1 规则在导出时计算并冻结，脱离 30 天保留期。
    **分数溯源已落地（S0.3a）**：`discovery_candidates` 新增 `score_source` /
    `llm_score_raw` 两列（cap 置零前的教师原始分被保留）；导出必须走
