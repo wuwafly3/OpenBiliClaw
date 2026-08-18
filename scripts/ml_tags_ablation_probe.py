@@ -20,11 +20,13 @@ Measured result on the production database (see
 docs/plans/2026-08-16-ml-tags-ablation-probe.md): dRho = +0.111 (rho 0.604
 -> 0.715; AUC 0.799 -> 0.864), xhs rho +0.210 — decision: A.
 
-Dataset assembly follows the provenance-safe policy: teacher label =
-persisted non-zero relevance_score (caps only zero) else the score recovered
-from evaluator_prefilter_shadow_audit; ambiguous zero rows without an audit
-join are dropped. Labels for the AUC view use the per-row effective
-admission threshold (explore 0.58, otherwise 0.60).
+Dataset assembly follows ``export_ranking_dataset.resolve_teacher_label``:
+LLM-judgment ``score_source`` uses ``llm_score_raw``; legacy empty source
+keeps a non-zero ``relevance_score`` or recovers from
+``evaluator_prefilter_shadow_audit``; prefilter / viewed / truncated /
+error rows are dropped even when ``relevance_score`` is non-zero. Labels
+for the AUC view use the per-row effective admission threshold (exact
+strategy ``explore`` uses 0.58, otherwise 0.60).
 
 Usage:
     python scripts/ml_tags_ablation_probe.py [db] [--folds 5] [--seeds 3] \
@@ -50,6 +52,16 @@ from sklearn.linear_model import LogisticRegression, RidgeCV
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
+
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+from export_ranking_dataset import (  # noqa: E402
+    candidate_row_for_label,
+    effective_admission_threshold,
+    resolve_teacher_label,
+    teacher_label_select_columns,
+)
 
 DEFAULT_DB = Path("E:/otherproject/OpenBiliClaw/data/openbiliclaw.db")
 
@@ -78,8 +90,6 @@ ENGAGEMENT_COLUMNS = (
 TOP_STRATEGIES = 8
 MIN_STYLE_CLASS_ROWS = 10
 TOP_TOPICS = 15
-ADMISSION_DEFAULT = 0.60
-ADMISSION_EXPLORE = 0.58
 
 
 def audit_hash(identity: str) -> str:
@@ -118,6 +128,7 @@ def build_records(
                    content_type, candidate_tier, title, description, body_text,
                    duration, {', '.join(ENGAGEMENT_COLUMNS)},
                    relevance_score, style_key, temporal_class, topic_group
+                   {teacher_label_select_columns(conn)}
             FROM discovery_candidates
             WHERE status IN ({', '.join('?' for _ in EVALUATED_STATUSES)})""",
         tuple(sorted(EVALUATED_STATUSES)),
@@ -126,17 +137,22 @@ def build_records(
     records: list[dict[str, Any]] = []
     stats: Counter = Counter()
     for row in rows:
-        persisted = float(row["relevance_score"] or 0.0)
         entry = audit.get(audit_hash(str(row["candidate_key"])))
-        if persisted > 0.0:
-            label = persisted
-            stats["label_from_candidates"] += 1
-        elif entry is not None and entry["llm_score"] is not None:
-            label = float(entry["llm_score"])
+        audit_score = (
+            float(entry["llm_score"])
+            if entry is not None and entry["llm_score"] is not None
+            else None
+        )
+        resolved = resolve_teacher_label(candidate_row_for_label(row), audit_score)
+        if resolved is None:
+            stats["dropped"] += 1
+            continue
+        label, policy = resolved
+        stats[policy] += 1
+        if policy == "legacy_audit_recovered":
             stats["label_recovered_from_audit"] += 1
         else:
-            stats["dropped_ambiguous_zero"] += 1
-            continue
+            stats["label_from_candidates"] += 1
         record: dict[str, Any] = {
             "label": label,
             "platform": str(row["source_platform"] or "unknown"),
@@ -228,13 +244,7 @@ def build_features(
 
     y = np.asarray([r["label"] for r in records], dtype=float)
     y_binary = np.asarray(
-        [
-            1
-            if r["label"]
-            >= (ADMISSION_EXPLORE if "explore" in r["strategy"] else ADMISSION_DEFAULT)
-            else 0
-            for r in records
-        ],
+        [1 if r["label"] >= effective_admission_threshold(r["strategy"]) else 0 for r in records],
         dtype=int,
     )
     platforms = np.asarray([r["platform"] for r in records])

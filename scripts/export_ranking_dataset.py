@@ -16,7 +16,9 @@ Row policy (``resolve_teacher_label``):
 - any other score_source (prefilter/viewed/truncated/...) is dropped.
 
 The frozen binary label follows spec S1.1: y = teacher_score >= per-row
-effective admission threshold (explore 0.58, otherwise 0.60). Batch identity
+effective admission threshold (exact strategy ``explore`` uses 0.58,
+otherwise 0.60 — prefixes such as ``explore-backfill`` stay at the default).
+Batch identity
 (evaluated_at cluster), teacher_model, and the full shadow-audit aggregates
 are exported alongside; title/description/body_text are included because the
 export is local training data (stays on this machine) and the text-vector
@@ -47,6 +49,8 @@ DEFAULT_OUT = Path("data/ml_ranking_dataset")
 EXPORT_SCHEMA_VERSION = 1
 ADMISSION_DEFAULT = 0.60
 ADMISSION_EXPLORE = 0.58
+# Keep in sync with openbiliclaw.discovery.admission.EXPLORE_STRATEGY.
+EXPLORE_STRATEGY = "explore"
 
 EVALUATED_STATUSES = (
     "evaluated",
@@ -104,10 +108,33 @@ def audit_hash(identity: str) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def effective_admission_threshold(source_strategy: str) -> float:
-    """Per-row gate from spec S1.1 (explore rows use their lower floor)."""
+def effective_admission_threshold(source_strategy: object) -> float:
+    """Per-row gate from spec S1.1; only exact ``explore`` uses the lower floor.
 
-    return ADMISSION_EXPLORE if "explore" in str(source_strategy or "") else ADMISSION_DEFAULT
+    Matches ``openbiliclaw.discovery.admission.effective_admission_threshold``
+    for the default policy floor. A live requested threshold may raise a
+    source's floor, but that is not frozen into the export label.
+    """
+
+    strategy = str(source_strategy or "").strip().lower()
+    return ADMISSION_EXPLORE if strategy == EXPLORE_STRATEGY else ADMISSION_DEFAULT
+
+
+def teacher_label_select_columns(conn: sqlite3.Connection) -> str:
+    """Optional provenance columns, skipped on pre-taxonomy databases."""
+
+    existing = {str(row["name"]) for row in conn.execute("PRAGMA table_info(discovery_candidates)")}
+    extra = [column for column in ("score_source", "llm_score_raw") if column in existing]
+    return (", " + ", ".join(extra)) if extra else ""
+
+
+def candidate_row_for_label(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    """Normalize a candidate row so ``resolve_teacher_label`` can read it."""
+
+    record = dict(row)
+    record.setdefault("score_source", "")
+    record.setdefault("llm_score_raw", None)
+    return record
 
 
 def resolve_teacher_label(

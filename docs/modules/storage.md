@@ -479,7 +479,7 @@ total = db.count_recommendation_impressions()
 - 表中没有标题、URL、作者、推荐文案或画像文本，沿用 `evaluator_prefilter_shadow_audit` 的隐私先例；只保留 `recommendation_id` / `item_key` / `surface` / `position` / `source_platform` 与两个时间戳。
 - `surface` 限定为 `extension` / `desktop_web` / `mobile_web` / `cli` / `unknown` 五个枚举值，非法值直接拒绝。`unknown` 是刻意保留的兜底：错标的曝光仍是有效训练样本，丢掉的曝光则是永久缺失的负样本。
 - 每次 insert 后清理 30 天前记录并只保留最新 200,000 行。行数上界高于 prefilter audit 的 20,000，因为单次 serve 窗口最多写 20 行且该账本是唯一负样本来源，200,000 行约相当于一年重度日常使用。
-- 调用方按 best-effort 对待：API 与 CLI 都吞掉写入异常，遥测失败绝不使用户的推荐请求失败。
+- 调用方按 best-effort 对待：API 与 CLI 都吞掉写入异常，遥测失败绝不使用户的推荐请求失败。API 侧 60 秒窗口去抖只在账本写入成功后更新签名，瞬时失败允许同一窗口立即重试，避免丢掉 Wave 0 / Wave 2 依赖的负样本。
 
 ### Evaluator Prefilter Shadow Audit
 

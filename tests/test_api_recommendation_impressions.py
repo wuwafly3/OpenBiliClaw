@@ -219,6 +219,29 @@ class TestImpressionLoggingBehaviour:
         assert response.status_code == 200
         assert len(response.json()["items"]) == 1
 
+    def test_storage_failure_does_not_debounce_retries(self) -> None:
+        """A failed ledger write must not lock the same window out for 60 seconds."""
+        database = _FakeDatabase()
+        calls = {"n": 0}
+        original = database.record_recommendation_impressions
+
+        def _flaky(impressions: list[dict[str, Any]]) -> int:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("ledger unavailable")
+            return original(impressions)
+
+        database.record_recommendation_impressions = _flaky  # type: ignore[method-assign]
+        client = TestClient(create_app(database=database))
+
+        first = client.get("/api/recommendations")
+        second = client.get("/api/recommendations")
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert calls["n"] == 2
+        assert len(database.impressions) == 1
+
     def test_legacy_database_without_the_ledger_is_tolerated(self) -> None:
         class LegacyDatabase:
             def get_recommendations(

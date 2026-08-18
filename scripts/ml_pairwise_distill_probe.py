@@ -11,6 +11,12 @@ invariant to it by construction.
 Batch identity is recovered from ``discovery_candidates.evaluated_at`` —
 one CURRENT_TIMESTAMP per persisted evaluation batch, clusters of <= 30.
 
+Teacher labels follow ``export_ranking_dataset.resolve_teacher_label``:
+LLM-judgment ``score_source`` uses ``llm_score_raw``; legacy empty source
+keeps a non-zero ``relevance_score`` or recovers from the shadow audit;
+prefilter / viewed / truncated / error rows are dropped even when
+``relevance_score`` is non-zero.
+
 This probe trains identical numpy MLPs (64-32-1, Adam) differing only in the
 loss — pointwise MSE / batch-pairwise logistic / hybrid — plus a Ridge
 reference, then routes every model through an isotonic calibration layer fit
@@ -45,6 +51,15 @@ from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import RidgeCV
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
+
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+from export_ranking_dataset import (  # noqa: E402
+    candidate_row_for_label,
+    resolve_teacher_label,
+    teacher_label_select_columns,
+)
 
 DEFAULT_DB = Path("E:/otherproject/OpenBiliClaw/data/openbiliclaw.db")
 
@@ -148,9 +163,7 @@ def load_audit(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
 def build_dataset(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Rows with untruncated teacher labels + recovered batch identity.
 
-    Provenance policy identical to the multitask probe: non-zero persisted
-    scores are genuine teacher judgments (caps only zero); zero rows are
-    recovered from the shadow audit when possible, else dropped.
+    Provenance policy identical to ``export_ranking_dataset.resolve_teacher_label``.
     """
 
     audit = load_audit(conn)
@@ -158,7 +171,7 @@ def build_dataset(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], dict[
         "candidate_key, status, source_platform, source_strategy, content_type, "
         "candidate_tier, title, description, body_text, published_at, evaluated_at, "
         "duration, " + ", ".join(ENGAGEMENT_COLUMNS) + ", "
-        "relevance_score"
+        "relevance_score" + teacher_label_select_columns(conn)
     )
     rows = conn.execute(
         f"SELECT {columns} FROM discovery_candidates WHERE status IN "
@@ -170,16 +183,21 @@ def build_dataset(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], dict[
     stats: Counter = Counter()
     for row in rows:
         entry = audit.get(audit_hash(str(row["candidate_key"])))
-        persisted = float(row["relevance_score"] or 0.0)
-        if persisted > 0.0:
-            label = persisted
-            stats["label_from_candidates"] += 1
-        elif entry is not None and entry["teacher_score"] is not None:
-            label = float(entry["teacher_score"])
+        audit_score = (
+            float(entry["teacher_score"])
+            if entry is not None and entry["teacher_score"] is not None
+            else None
+        )
+        resolved = resolve_teacher_label(candidate_row_for_label(row), audit_score)
+        if resolved is None:
+            stats["dropped"] += 1
+            continue
+        label, policy = resolved
+        stats[policy] += 1
+        if policy == "legacy_audit_recovered":
             stats["label_recovered_from_audit"] += 1
         else:
-            stats["dropped_ambiguous_zero"] += 1
-            continue
+            stats["label_from_candidates"] += 1
         age = parse_age_days(str(row["published_at"] or ""), str(row["evaluated_at"] or ""))
         record: dict[str, Any] = {
             "label": label,

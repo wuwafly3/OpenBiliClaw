@@ -879,8 +879,7 @@ def _interface_ipv6_candidates() -> list[str]:
         if proc.returncode != 0:
             continue
         for token in re.findall(
-            r"(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f:]*"
-            r"(?:%[\w.-]+)?(?:/\d+)?",
+            r"(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f:]*" r"(?:%[\w.-]+)?(?:/\d+)?",
             proc.stdout,
         ):
             candidate = token.split("/", 1)[0].split("%", 1)[0]
@@ -7499,6 +7498,9 @@ def create_app(
         card stays in the unprocessed window for hours. The per-surface
         signature debounce below keeps a poll loop from issuing a 20-row write
         every second; the storage upsert still dedups whatever does get through.
+        The debounce signature is recorded only after a successful write, so a
+        transient ledger failure can retry inside the same 60-second window
+        instead of dropping Wave 0 / Wave 2 negative samples.
         """
         if not items:
             return
@@ -7536,9 +7538,11 @@ def create_app(
             and now - previous[1] < _IMPRESSION_LOG_DEBOUNCE_SECONDS
         ):
             return
-        impression_log_signatures[surface] = (signature, now)
-        with suppress(Exception):
+        try:
             record(payload)
+        except Exception:
+            return
+        impression_log_signatures[surface] = (signature, now)
 
     async def _load_recommendations(
         disliked_topics: list[str] | None = None,

@@ -112,7 +112,7 @@ result，再经过后端身份门禁转换统一事件和账号分区 Node affin
 
 | 方法与路径 | 状态 | 契约 |
 |---|---|---|
-| `GET /api/recommendations` | ✅ | 只读未处理历史；1 秒 snapshot 只有在 TTL 与 effective dislike digest 都未变化时复用。加载期间 dislike 变化会按新快照重读，再在 franchise cap 前过滤。每条返回路径（含缓存命中）都按表面写曝光账本 `recommendation_impressions`，同表面 60 秒内窗口不变则去抖，绝不写 `recommendations.presented`。 |
+| `GET /api/recommendations` | ✅ | 只读未处理历史；1 秒 snapshot 只有在 TTL 与 effective dislike digest 都未变化时复用。加载期间 dislike 变化会按新快照重读，再在 franchise cap 前过滤。每条返回路径（含缓存命中）都按表面写曝光账本 `recommendation_impressions`，同表面 60 秒内窗口不变则去抖；去抖签名仅在账本写入成功后更新，瞬时写失败允许同一窗口立即重试，绝不写 `recommendations.presented`。 |
 | `POST /api/recommendations/reshuffle` / `append` | ✅ | serve 使用带 flat-preference overlay 的画像，完成后在 HTTP 序列化前再读一次最新 effective dislikes，关闭请求进行中的偏好竞态。返回前按表面写曝光账本。 |
 | `GET /api/notifications/pending` | ✅ | 单条候选在返回前按最新 dislike 复核；模糊命中时不使用多卡窗口的“全灭恢复”保护。 |
 | profile edit / `POST /api/feedback` | ✅ | durable edit 或单卡反馈 projection 完成后立即失效 recommendation snapshot；单卡反馈仍由 `exclude_processed` 同步隐藏。 |

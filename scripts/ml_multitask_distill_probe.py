@@ -8,11 +8,12 @@ variant (predicted aux probabilities as features), and single-task baselines,
 then compares held-out rank correlation.
 
 Dataset assembly (read-only):
-- ``discovery_candidates`` rows with an eval outcome; teacher label =
-  ``relevance_score`` when non-zero (genuine LLM judgment — caps only zero),
-  otherwise the score recovered from ``evaluator_prefilter_shadow_audit``
-  (cap-zeroed rows keep their at-time ``llm_score`` there).
-- Rows that are zero with no audit join are dropped (ambiguous origin).
+- ``discovery_candidates`` rows with an eval outcome; teacher label follows
+  ``export_ranking_dataset.resolve_teacher_label`` (LLM-judgment
+  ``score_source`` uses ``llm_score_raw``; legacy empty source keeps a
+  non-zero ``relevance_score`` or recovers from
+  ``evaluator_prefilter_shadow_audit``; prefilter / viewed / truncated /
+  error rows are dropped even when ``relevance_score`` is non-zero).
 - Features are evaluation-time deterministic quantities only: shadow-audit
   similarity aggregates, engagement log-counts + availability masks, duration,
   published age, text length stats, platform/strategy/context one-hots.
@@ -43,6 +44,15 @@ from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.linear_model import LogisticRegression, RidgeCV
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
+
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+from export_ranking_dataset import (  # noqa: E402
+    candidate_row_for_label,
+    resolve_teacher_label,
+    teacher_label_select_columns,
+)
 
 DEFAULT_DB = Path("E:/otherproject/OpenBiliClaw/data/openbiliclaw.db")
 
@@ -154,7 +164,7 @@ def build_dataset(conn: sqlite3.Connection) -> tuple[dict[str, list[Any]], dict[
         "candidate_key, status, source_platform, source_strategy, content_type, "
         "candidate_tier, title, description, body_text, published_at, evaluated_at, "
         "duration, " + ", ".join(ENGAGEMENT_COLUMNS) + ", "
-        "relevance_score, style_key, temporal_class"
+        "relevance_score, style_key, temporal_class" + teacher_label_select_columns(conn)
     )
     rows = conn.execute(
         f"SELECT {columns} FROM discovery_candidates WHERE status IN "
@@ -167,16 +177,21 @@ def build_dataset(conn: sqlite3.Connection) -> tuple[dict[str, list[Any]], dict[
     for row in rows:
         identity = str(row["candidate_key"])
         entry = audit.get(audit_hash(identity))
-        persisted = float(row["relevance_score"] or 0.0)
-        if persisted > 0.0:
-            label = persisted  # caps only zero scores; non-zero is a genuine judgment
-            stats["label_from_candidates"] += 1
-        elif entry is not None and entry["teacher_score"] is not None:
-            label = float(entry["teacher_score"])  # cap-zeroed, recovered at-time
+        audit_score = (
+            float(entry["teacher_score"])
+            if entry is not None and entry["teacher_score"] is not None
+            else None
+        )
+        resolved = resolve_teacher_label(candidate_row_for_label(row), audit_score)
+        if resolved is None:
+            stats["dropped"] += 1
+            continue
+        label, policy = resolved
+        stats[policy] += 1
+        if policy == "legacy_audit_recovered":
             stats["label_recovered_from_audit"] += 1
         else:
-            stats["dropped_ambiguous_zero"] += 1
-            continue
+            stats["label_from_candidates"] += 1
 
         style = str(row["style_key"] or "")
         temporal = TEMPORAL_MERGES.get(
@@ -216,11 +231,15 @@ def build_dataset(conn: sqlite3.Connection) -> tuple[dict[str, list[Any]], dict[
     # Label sanity: rows with both sources should agree (re-evals under a
     # different profile digest legitimately drift; report the spread).
     for row in rows:
-        persisted = float(row["relevance_score"] or 0.0)
         entry = audit.get(audit_hash(str(row["candidate_key"])))
-        if persisted > 0.0 and entry is not None and entry["teacher_score"] is not None:
-            delta = abs(persisted - float(entry["teacher_score"]))
-            data.setdefault("label_deltas", []).append(delta)
+        if entry is None or entry["teacher_score"] is None:
+            continue
+        resolved = resolve_teacher_label(candidate_row_for_label(row), None)
+        if resolved is None:
+            continue
+        teacher_score, _policy = resolved
+        delta = abs(teacher_score - float(entry["teacher_score"]))
+        data.setdefault("label_deltas", []).append(delta)
 
     return data, stats
 
