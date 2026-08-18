@@ -13297,6 +13297,10 @@ def _build_discovery_candidate_pipeline(
     if callable(set_admission_min_score):
         with suppress(Exception):
             set_admission_min_score(admission_min_score)
+    set_delight_queue_limit = getattr(database, "set_delight_queue_limit", None)
+    if callable(set_delight_queue_limit):
+        with suppress(Exception):
+            set_delight_queue_limit(getattr(config.scheduler, "delight_queue_limit", 20))
     return DiscoveryCandidatePipeline(
         database=database,
         discovery_engine=discovery_engine,

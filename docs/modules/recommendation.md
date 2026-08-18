@@ -419,7 +419,7 @@ Content-Type: application/json
 
 因此本地 like 成功、`pending-batch` 重灌返回 `state="liked"`，以及 `delight.liked` 实时事件都会收敛到同一 UI：状态文案保留，like 仅阻止重复提交，「看看 / 稍后再看 / 收藏 / 不感兴趣 / 聊一聊」仍可继续操作；like POST 失败则恢复未选中状态供重试。
 
-惊喜与普通推荐互斥：被惊喜通道认领的内容（已作为惊喜送达过，或 delight 分数达动态阈值、正式 `pool_expression / pool_topic_label` 已就绪，且 `delight_reason / delight_hook` 已同步为它们的精确快照）会被 `get_pool_candidates` / `count_pool_candidates` 的 servable 闸门排除，普通推荐 serve 与「还有 N 条」计数都不会再出同一条内容。认领不接受可能来自旧版的任意非空 `reason/hook`；尚未生成正式文案或快照尚未同步的行不会被认领，前者仍可进入 expression-copy backlog，后者等待 profile-aware scorer 决定是否进入惊喜。
+惊喜与普通推荐互斥：被惊喜通道认领的内容（已作为惊喜送达过，或当前属于 `/api/delight/pending-batch` 会返回的那一组——分数达动态阈值、正式 `pool_expression / pool_topic_label` 已就绪且 `delight_reason / delight_hook` 已同步为它们的精确快照，条数上限为 `scheduler.delight_queue_limit`）会被 `get_pool_candidates` / `count_pool_candidates` 的 servable 闸门排除，普通推荐 serve 与「还有 N 条」计数都不会再出同一条内容。超出队列上限的高分行仍留在普通推荐，清理惊喜卡片后下方列表可以补货。认领不接受可能来自旧版的任意非空 `reason/hook`；尚未生成正式文案或快照尚未同步的行不会被认领，前者仍可进入 expression-copy backlog，后者等待 profile-aware scorer 决定是否进入惊喜。
 
 ### PoolCurator
 

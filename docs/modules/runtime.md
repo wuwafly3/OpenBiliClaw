@@ -601,7 +601,7 @@ XHS / 抖音 / YouTube / 知乎 / Reddit / V2EX 的插件任务桥保留两层�
 | `scheduler.trending_refresh_minutes` | `3` | `trending` 策略最小刷新间隔（分钟）。v0.3.186 起单位由小时改为分钟；旧键 `trending_refresh_hours` 读取时按 ×60 换算。 |
 | `scheduler.explore_refresh_minutes` | `3` | `explore` 策略最小刷新间隔；统一关键词 planner 会复用这条 refresh plan 时钟，在到期或距到期不足一个 `refresh_check_interval_seconds` 且 B 站有补货空间时，把探索 query 生成合并进当轮关键词调用。 |
 | `scheduler.discovery_limit` | `30` | 单轮 discovery wave 候选上限，最大 `60`。 |
-| `scheduler.delight_queue_limit` | `20` | 惊喜推荐队列默认加载数量；桌面 Web、移动 Web 和浏览器插件默认共享，范围 `1..100`。 |
+| `scheduler.delight_queue_limit` | `20` | 惊喜推荐队列默认加载数量；桌面 Web、移动 Web 和浏览器插件默认共享，范围 `1..100`。同一上限也约束普通推荐的 delight 占位，超出队列的高分行仍留在常规列表。 |
 | `scheduler.proactive_push_interval_seconds` | `120` | 主动推荐 / probe 推送循环间隔。 |
 | `scheduler.speculator_idle_interval_minutes` | `30` | 画像 pipeline 空闲时检查猜测兴趣生命周期的间隔。 |
 | `scheduler.avoidance_speculation_interval_minutes` | `10` | 不喜欢领域探针生成间隔。 |

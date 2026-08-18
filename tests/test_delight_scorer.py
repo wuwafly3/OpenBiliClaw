@@ -314,6 +314,32 @@ def test_delight_claim_threshold_floor_in_sync() -> None:
     assert _DELIGHT_CLAIM_MIN_SCORE == DEFAULT_DELIGHT_THRESHOLD
 
 
+def test_delight_queue_limit_default_in_sync() -> None:
+    """storage mirrors scheduler.delight_queue_limit as the claim-cap default."""
+    from openbiliclaw.config import SchedulerConfig
+    from openbiliclaw.storage.database import _DEFAULT_DELIGHT_QUEUE_LIMIT
+
+    assert SchedulerConfig().delight_queue_limit == _DEFAULT_DELIGHT_QUEUE_LIMIT
+
+
+def test_set_delight_queue_limit_clamps_to_scheduler_range(tmp_path: Path) -> None:
+    from openbiliclaw.storage.database import (
+        _DEFAULT_DELIGHT_QUEUE_LIMIT,
+        _MAX_DELIGHT_QUEUE_LIMIT,
+        _MIN_DELIGHT_QUEUE_LIMIT,
+    )
+
+    database = _make_database(tmp_path)
+    database.set_delight_queue_limit(0)
+    assert database._delight_queue_limit == _MIN_DELIGHT_QUEUE_LIMIT
+    database.set_delight_queue_limit(250)
+    assert database._delight_queue_limit == _MAX_DELIGHT_QUEUE_LIMIT
+    database.set_delight_queue_limit("not-a-limit")
+    assert database._delight_queue_limit == _DEFAULT_DELIGHT_QUEUE_LIMIT
+    database.set_delight_queue_limit(7)
+    assert database._delight_queue_limit == 7
+
+
 def _seed_delight_scored_pool(
     database: Database,
     count: int,

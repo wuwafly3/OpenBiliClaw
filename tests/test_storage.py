@@ -3559,9 +3559,9 @@ class TestDatabase:
             assert purged == 0
 
             rows = db.get_cached_content(limit=10)
-            assert rows[0]["pool_status"] == "fresh", (
-                "Already-recommended items must be preserved for history audit"
-            )
+            assert (
+                rows[0]["pool_status"] == "fresh"
+            ), "Already-recommended items must be preserved for history audit"
             db.close()
 
     def test_purge_pool_by_disliked_topics_skips_non_fresh_items(self) -> None:
@@ -3991,9 +3991,10 @@ class TestDatabase:
         """Surprise-channel rows never enter the regular feed.
 
         A row is delight-claimed when it was delivered as a surprise
-        (delight_notified=1) or has a score above the threshold with its exact
-        formal-copy snapshot ready. An unsynchronized evaluator reason must
-        not claim the row, and an uncopied high-score row remains available to
+        (delight_notified=1) or currently occupies the pending-batch set
+        (score above the threshold with its exact formal-copy snapshot ready,
+        unseen, un-notified). An unsynchronized evaluator reason must not
+        claim the row, and an uncopied high-score row remains available to
         the expression-copy backlog. Sub-threshold delight scores keep the row
         servable. count_pool_candidates must agree with get_pool_candidates so
         the "还有 N 条" display never overstates what serve() can load.
@@ -4090,6 +4091,96 @@ class TestDatabase:
                 "BV1UNSYNC",
             }
             assert db.count_pool_candidates() == 3
+
+            db.close()
+
+    def test_get_pool_candidates_keeps_delight_overflow_after_queue_cap(self) -> None:
+        """Only the current surprise queue is reserved from the regular feed.
+
+        Clearing several delight cards used to leave the list below empty
+        because every synced row at/above the 0.75 floor was claimed. The
+        reservation now matches pending-batch: top N plus already-notified
+        rows. Surplus high-score items stay servable so the regular feed
+        can refill after the queue is dismissed.
+        """
+        from openbiliclaw.storage.database import _DELIGHT_CLAIM_MIN_SCORE
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "test.db")
+            db.initialize()
+            db.set_delight_queue_limit(2)
+
+            _seed_visible(
+                db,
+                "BV1NORM",
+                title="普通候选",
+                up_name="UPA",
+                source="search",
+                relevance_score=0.91,
+                topic_group="组普通",
+            )
+            scored_rows = (
+                ("BV1D95", 0.95, "组95"),
+                ("BV1D90", 0.90, "组90"),
+                ("BV1D85", 0.85, "组85"),
+                ("BV1D80", 0.80, "组80"),
+                ("BV1D76", 0.76, "组76"),
+            )
+            for bvid, score, topic_group in scored_rows:
+                _seed_visible(
+                    db,
+                    bvid,
+                    title=bvid,
+                    up_name="UPB",
+                    source="search",
+                    relevance_score=0.92,
+                    topic_group=topic_group,
+                )
+                db.update_delight_score(
+                    bvid,
+                    delight_score=score,
+                    delight_reason="测试推荐文案",
+                    delight_hook="测试主题",
+                )
+            db.conn.commit()
+
+            threshold = db.dynamic_delight_threshold(default_threshold=_DELIGHT_CLAIM_MIN_SCORE)
+            queued = {
+                row["bvid"]
+                for row in db.get_delight_candidates(
+                    min_delight_score=threshold,
+                    limit=2,
+                    include_liked=True,
+                )
+            }
+            assert queued == {"BV1D95", "BV1D90"}
+
+            items = db.get_pool_candidates(limit=20)
+            bvids = {item["bvid"] for item in items}
+            assert queued.isdisjoint(bvids)
+            assert bvids == {"BV1NORM", "BV1D85", "BV1D80", "BV1D76"}
+            assert db.count_pool_candidates() == 4
+
+            for bvid in queued:
+                db.mark_delight_notified(bvid)
+
+            next_queued = {
+                row["bvid"]
+                for row in db.get_delight_candidates(
+                    min_delight_score=threshold,
+                    limit=2,
+                    include_liked=True,
+                )
+            }
+            assert next_queued == {"BV1D85", "BV1D80"}
+
+            items = db.get_pool_candidates(limit=20)
+            bvids = {item["bvid"] for item in items}
+            assert next_queued.isdisjoint(bvids)
+            assert bvids == {"BV1NORM", "BV1D76"}
+            assert "BV1D95" not in bvids
+            assert "BV1D90" not in bvids
+            assert db.count_pool_candidates() == 2
 
             db.close()
 
@@ -5521,9 +5612,9 @@ class TestDatabase:
             after_row = db.conn.execute(
                 "SELECT first_event_id FROM seen_items WHERE content_id = 'BVWATCHED'"
             ).fetchone()
-            assert after_row["first_event_id"] == watched_row["first_event_id"], (
-                "真实事件的溯源不该被快照覆盖"
-            )
+            assert (
+                after_row["first_event_id"] == watched_row["first_event_id"]
+            ), "真实事件的溯源不该被快照覆盖"
             assert db.mark_items_seen("bilibili", ["BVSNAP1"]) == 0, "重复标记要幂等"
             db.close()
 

@@ -906,6 +906,12 @@ _DELIGHT_DYNAMIC_MIN_SAMPLE_SIZE = 150
 _DELIGHT_DYNAMIC_MIN_STDDEV = 0.08
 _DELIGHT_SCORE_SYNC_EPSILON = 0.000001
 _DEFAULT_ADMISSION_MIN_SCORE = DEFAULT_ADMISSION_MIN_SCORE
+# Mirrors config.scheduler.delight_queue_limit. Storage stays a leaf, so the
+# default and 1..100 clamp are duplicated here and pinned by
+# tests/test_delight_scorer.py::test_delight_queue_limit_default_in_sync.
+_DEFAULT_DELIGHT_QUEUE_LIMIT = 20
+_MIN_DELIGHT_QUEUE_LIMIT = 1
+_MAX_DELIGHT_QUEUE_LIMIT = 100
 
 
 # A row cannot enter delight scoring until the same user-facing copy gate as
@@ -930,26 +936,22 @@ def _delight_unseen_guard_sql() -> str:
     """
 
 
-# Rows claimed by the surprise (delight) channel: already delivered as a
-# delight, or scored above the current threshold with its formal pool copy
-# synchronized into the delight snapshot. Requiring the exact snapshot keeps
-# stale evaluator reasons from claiming rows and preserves the profile-aware
-# scorer decision (for example the conservative 0.80 threshold).
-def _delight_claim_guard_sql() -> str:
-    return """
-                  AND NOT (
-                    COALESCE(delight_notified, 0) = 1
-                    OR (
-                      COALESCE(delight_score, 0.0) >= ?
-                      AND TRIM(COALESCE(pool_expression, '')) != ''
-                      AND TRIM(COALESCE(pool_topic_label, '')) != ''
-                      AND TRIM(COALESCE(delight_reason, '')) =
-                          TRIM(COALESCE(pool_expression, ''))
-                      AND TRIM(COALESCE(delight_hook, '')) =
-                          TRIM(COALESCE(pool_topic_label, ''))
-                    )
-                  )
-"""
+def _normalize_delight_queue_limit(value: object) -> int:
+    """Clamp the surprise-queue reservation to the scheduler 1..100 contract."""
+    if isinstance(value, bool):
+        return _DEFAULT_DELIGHT_QUEUE_LIMIT
+    if isinstance(value, int):
+        raw = value
+    elif isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        raw = int(value)
+    elif isinstance(value, str):
+        try:
+            raw = int(value.strip())
+        except ValueError:
+            return _DEFAULT_DELIGHT_QUEUE_LIMIT
+    else:
+        return _DEFAULT_DELIGHT_QUEUE_LIMIT
+    return max(_MIN_DELIGHT_QUEUE_LIMIT, min(_MAX_DELIGHT_QUEUE_LIMIT, raw))
 
 
 _LEGACY_STYLE_KEY_MAP: dict[str, str] = {
@@ -2034,6 +2036,7 @@ class Database:
         self._connection_owner_thread_id: int | None = None
         self._connections_by_thread: dict[int, sqlite3.Connection] = {}
         self._admission_min_score = _DEFAULT_ADMISSION_MIN_SCORE
+        self._delight_queue_limit = _DEFAULT_DELIGHT_QUEUE_LIMIT
         self._preserve_read_transaction = False
         # The two queues must remain separate: a slow/background maintenance
         # batch must never sit in front of an interactive recommendation read.
@@ -2054,6 +2057,10 @@ class Database:
     def set_admission_min_score(self, value: object) -> None:
         """Set the unified recommendation-pool admission floor."""
         self._admission_min_score = _normalize_admission_min_score(value)
+
+    def set_delight_queue_limit(self, value: object) -> None:
+        """Set how many current surprise-queue rows the regular feed reserves."""
+        self._delight_queue_limit = _normalize_delight_queue_limit(value)
 
     def initialize(self) -> None:
         """Initialize the database and run migrations if needed."""
@@ -2314,6 +2321,7 @@ class Database:
         isolated = Database(self._db_path)
         isolated._conn = conn
         isolated._admission_min_score = self._admission_min_score
+        isolated._delight_queue_limit = self._delight_queue_limit
         isolated._seen_state_lock = self._seen_state_lock
         isolated._seen_state_cache = self._seen_state_cache
         return isolated
@@ -7392,9 +7400,11 @@ class Database:
         ordering for callers that need it (e.g. health checks).
 
         Rows claimed by the surprise (delight) channel are excluded via the
-        delight claim guard — a delight that was delivered or is
-        currently queue-eligible must never be duplicated by the regular
-        feed. ``count_pool_candidates`` applies the same guard so the
+        delight claim guard — a delight that was delivered, or that
+        currently occupies the pending-batch set of size
+        ``scheduler.delight_queue_limit``, must never be duplicated by the
+        regular feed. Surplus above-threshold rows stay servable.
+        ``count_pool_candidates`` applies the same guard so the
         "还有 N 条" display stays in sync with what serve() can load.
 
         Notes:
@@ -7445,6 +7455,53 @@ class Database:
             by_bvid.update((str(row["bvid"]), dict(row)) for row in cursor.fetchall())
         return [by_bvid[bvid] for bvid in ordered_bvids if bvid in by_bvid]
 
+    def _delight_claim_guard_on(
+        self,
+        conn: sqlite3.Connection,
+    ) -> tuple[str, tuple[Any, ...]]:
+        """Exclude delivered surprises and the current pending-batch set.
+
+        Score-based reservation is capped at ``scheduler.delight_queue_limit``
+        and uses the same SQL eligibility as ``get_delight_candidates``
+        (``include_liked=True``). Surplus above-threshold rows stay in the
+        regular feed so clearing the surprise queue can refill the list
+        below. Temporal eligibility stays a Python post-filter on both
+        surfaces; a temporally ineligible row can occupy one reservation
+        slot, which is rare relative to unbounded score claiming.
+        """
+        threshold = self._dynamic_delight_threshold_on(
+            conn, default_threshold=_DELIGHT_CLAIM_MIN_SCORE
+        )
+        admission_sql, admission_params = self._pool_admission_sql()
+        sql = f"""
+                  AND NOT (
+                    COALESCE(delight_notified, 0) = 1
+                    OR bvid IN (
+                      SELECT bvid FROM (
+                        SELECT bvid
+                        FROM content_cache
+                        WHERE COALESCE(delight_score, 0.0) >= ?
+                          AND {admission_sql}
+                          AND COALESCE(delight_notified, 0) = 0
+                          {_delight_ready_copy_sql()}
+                          AND TRIM(COALESCE(delight_reason, '')) =
+                              TRIM(COALESCE(pool_expression, ''))
+                          AND TRIM(COALESCE(delight_hook, '')) =
+                              TRIM(COALESCE(pool_topic_label, ''))
+                          AND COALESCE(feedback_type, '') IN ('', 'like')
+                          AND COALESCE(pool_status, 'fresh') IN ('fresh', 'shown')
+                          {_delight_unseen_guard_sql()}
+                        ORDER BY
+                            delight_score DESC,
+                            relevance_score DESC,
+                            discovered_at DESC
+                        LIMIT ?
+                      )
+                    )
+                  )
+"""
+        return sql, (threshold, *admission_params, self._delight_queue_limit)
+
     def _pool_servable_where_clause_on(
         self,
         conn: sqlite3.Connection,
@@ -7458,17 +7515,15 @@ class Database:
         into ``get_pool_candidates`` / ``_load_available_pool_candidate_rows``:
         fresh, not disliked, at/above the admission floor, fully classified
         (pool_expression / pool_topic_label / style_key / topic_group), xhs
-        rows carrying an ``xsec_token``, not claimed by the delight channel,
+        rows carrying an ``xsec_token``, not claimed by the current
+        surprise queue (or already delivered as a delight),
         and not already recommended. Returns the fragment (no leading
         ``WHERE``, references the ``content_cache`` table) and its bind params.
         """
         admission_sql, admission_params = self._pool_admission_sql()
         guard_sql = _xhs_self_author_guard_sql()
         guard_params = _xhs_self_author_guard_params(xhs_self_nickname)
-        delight_threshold = self._dynamic_delight_threshold_on(
-            conn, default_threshold=_DELIGHT_CLAIM_MIN_SCORE
-        )
-        delight_guard_sql = _delight_claim_guard_sql()
+        delight_guard_sql, delight_guard_params = self._delight_claim_guard_on(conn)
         clause = f"""
             COALESCE(pool_status, 'fresh') = ?
               AND COALESCE(feedback_type, '') != 'dislike'
@@ -7489,7 +7544,7 @@ class Database:
                 WHERE r.bvid = content_cache.bvid
               )
         """
-        return clause, (pool_status, *admission_params, *guard_params, delight_threshold)
+        return clause, (pool_status, *admission_params, *guard_params, *delight_guard_params)
 
     def _available_platform_rows_on(
         self,
@@ -7675,10 +7730,7 @@ class Database:
         admission_sql, admission_params = self._pool_admission_sql()
         guard_sql = _xhs_self_author_guard_sql()
         guard_params = _xhs_self_author_guard_params(xhs_self_nickname)
-        delight_threshold = self._dynamic_delight_threshold_on(
-            conn, default_threshold=_DELIGHT_CLAIM_MIN_SCORE
-        )
-        delight_guard_sql = _delight_claim_guard_sql()
+        delight_guard_sql, delight_guard_params = self._delight_claim_guard_on(conn)
         projection = (
             "*"
             if full_rows
@@ -7721,7 +7773,7 @@ class Database:
                 view_count DESC,
                 bvid ASC
             """,
-            (*admission_params, *guard_params, delight_threshold),
+            (*admission_params, *guard_params, *delight_guard_params),
         )
         rows = [dict(row) for row in cursor.fetchall()]
         viewed_content_keys = (
@@ -8221,10 +8273,7 @@ class Database:
         admission_sql, admission_params = self._pool_admission_sql()
         guard_sql = _xhs_self_author_guard_sql()
         guard_params = _xhs_self_author_guard_params(xhs_self_nickname)
-        delight_threshold = self._dynamic_delight_threshold_on(
-            conn, default_threshold=_DELIGHT_CLAIM_MIN_SCORE
-        )
-        delight_guard_sql = _delight_claim_guard_sql()
+        delight_guard_sql, delight_guard_params = self._delight_claim_guard_on(conn)
         max_rows = None if limit is None else max(0, int(limit))
         if max_rows == 0:
             return []
@@ -8259,7 +8308,7 @@ class Database:
                 view_count DESC,
                 bvid ASC
             """,
-            (*admission_params, *guard_params, delight_threshold),
+            (*admission_params, *guard_params, *delight_guard_params),
         )
         viewed_content_keys = (
             self._recent_viewed_content_keys_on(conn)

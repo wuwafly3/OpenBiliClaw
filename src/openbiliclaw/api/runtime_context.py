@@ -1108,6 +1108,9 @@ class RuntimeContext:
         set_admission_min_score = getattr(self.database, "set_admission_min_score", None)
         if callable(set_admission_min_score):
             set_admission_min_score(admission_min_score)
+        set_delight_queue_limit = getattr(self.database, "set_delight_queue_limit", None)
+        if callable(set_delight_queue_limit):
+            set_delight_queue_limit(getattr(new_config.scheduler, "delight_queue_limit", 20))
         new_candidate_pipeline = DiscoveryCandidatePipeline(
             database=self.database,
             discovery_engine=new_discovery_engine,
