@@ -605,7 +605,10 @@ class DiscoveryCandidatePipeline:
         if not callable(tag_fn):
             return
         try:
-            await tag_fn(untagged, batch_size=max(1, len(untagged)))
+            # Default batch size (45) so max_tokens stays in sync with the
+            # chunk the engine actually sends; untagged can reach the
+            # evaluate hard cap of 90 items.
+            await tag_fn(untagged)
         except Exception:
             logger.warning(
                 "tag-channel failed for %d candidate(s); continuing with full eval",

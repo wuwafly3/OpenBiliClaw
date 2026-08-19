@@ -10,6 +10,7 @@ teacher-only read allowlist.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -42,10 +43,13 @@ from .test_discovery_engine import (
     _split_retry_contents,
     _SplitRetryBatchLLMService,
 )
-from .test_search_strategy import FakeLLMService, _build_profile
+from .test_search_strategy import FakeLLMService, SoulProfile, _build_profile
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
+
+    from openbiliclaw.discovery.prefilter_audit import PrefilterShadowDecision
 
 
 class _VariedStyleBatchLLMService(_DynamicBatchLLMService):
@@ -603,3 +607,84 @@ async def test_evaluation_context_override_freezes_prompt_when_live_profile_muta
     assert "不应出现在冻结评估prompt里" not in prompt
     assert contents[0].profile_digest == snapshot.profile_digest
     assert engine._evaluation_profile_digest(profile) == snapshot.profile_digest
+
+
+async def test_bind_evaluation_context_is_task_scoped() -> None:
+    """Concurrent evaluations must not share one engine's bound snapshot.
+
+    The bind used to live on an instance attribute: a second in-flight
+    evaluation reused the first one's frozen profile (and the first one's
+    finally-unbind could strip it mid-batch). The ContextVar binding keeps
+    each task's snapshot isolated.
+    """
+    engine = ContentDiscoveryEngine(llm_service=None)
+    profile_a = _build_profile()
+    profile_a.preferences.interests[0].name = "任务甲画像标记"
+    profile_b = _build_profile()
+    profile_b.preferences.interests[0].name = "任务乙画像标记"
+    live_digest_a = engine._evaluation_profile_digest(profile_a)
+    live_digest_b = engine._evaluation_profile_digest(profile_b)
+
+    async def bind_yield_and_read(profile: SoulProfile) -> str:
+        _, token = engine._bind_evaluation_context(profile)
+        try:
+            # Let the sibling task bind while this one holds its snapshot,
+            # then keep holding it across another suspension so the sibling
+            # reads its digest while both tasks are still in flight.
+            await asyncio.sleep(0)
+            digest = engine._evaluation_profile_digest(profile)
+            await asyncio.sleep(0)
+            return digest
+        finally:
+            engine._unbind_evaluation_context(token)
+
+    digest_a, digest_b = await asyncio.gather(
+        bind_yield_and_read(profile_a),
+        bind_yield_and_read(profile_b),
+    )
+
+    assert digest_a == live_digest_a
+    assert digest_b == live_digest_b
+    assert digest_a != digest_b
+    # Nothing leaks once both tasks unbind.
+    assert engine._bound_evaluation_context() is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_batch_evaluations_use_their_own_profile() -> None:
+    class _YieldingPrefilterEngine(ContentDiscoveryEngine):
+        async def _embedding_prefilter_shadow_analysis(
+            self,
+            contents: Sequence[DiscoveredContent],
+            profile: SoulProfile,
+            *,
+            source_context: str,
+            profile_digest: str,
+        ) -> tuple[dict[int, float], list[PrefilterShadowDecision]]:
+            # Force a suspension between bind and prompt build so both
+            # evaluations are in flight at once.
+            await asyncio.sleep(0)
+            return {}, []
+
+    llm = _DynamicBatchLLMService()
+    engine = _YieldingPrefilterEngine(llm_service=llm, eval_prefilter_mode="shadow")
+    profile_a = _build_profile()
+    profile_a.preferences.interests[0].name = "并发画像甲"
+    profile_b = _build_profile()
+    profile_b.preferences.interests[0].name = "并发画像乙"
+    contents_a = [DiscoveredContent(bvid="BV_CONC_A", title="并发候选甲", source_strategy="search")]
+    contents_b = [DiscoveredContent(bvid="BV_CONC_B", title="并发候选乙", source_strategy="search")]
+
+    await asyncio.gather(
+        engine.evaluate_content_batch(contents_a, profile_a),
+        engine.evaluate_content_batch(contents_b, profile_b),
+    )
+
+    assert len(llm.user_inputs) == 2
+    prompt_a = next(prompt for prompt in llm.user_inputs if "并发候选甲" in prompt)
+    prompt_b = next(prompt for prompt in llm.user_inputs if "并发候选乙" in prompt)
+    assert "并发画像甲" in prompt_a
+    assert "并发画像乙" not in prompt_a
+    assert "并发画像乙" in prompt_b
+    assert "并发画像甲" not in prompt_b
+    assert contents_a[0].profile_digest != contents_b[0].profile_digest

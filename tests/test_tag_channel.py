@@ -175,7 +175,7 @@ async def test_tag_content_batch_uses_tag_batch_caller_and_does_not_mutate_score
     assert call["caller"] == "discovery.tag_batch"
     assert call["inject_core_memory"] is False
     assert call["json_mode"] is True
-    assert call["max_tokens"] == 1024
+    assert call["max_tokens"] == 256 + 64 * 3
     assert call["reasoning_effort"] == ""
     assert [item.relevance_score for item in contents] == scores
     assert [item.topic_group for item in contents] == teacher_topics
@@ -195,6 +195,28 @@ async def test_tag_content_batch_forwards_max_tokens_override() -> None:
     engine = ContentDiscoveryEngine(llm_service=llm)
     await engine.tag_content_batch(_sample_contents()[:1], max_tokens=4096)
     assert llm.calls[0]["max_tokens"] == 4096
+
+
+def _untagged_contents(count: int) -> list[DiscoveredContent]:
+    return [
+        DiscoveredContent(bvid=f"BVSC{i:02d}", title=f"条目{i}", source_strategy="search")
+        for i in range(count)
+    ]
+
+
+async def test_tag_content_batch_scales_max_tokens_with_chunk_size() -> None:
+    llm = _RecordingTagLLM(_three_item_payload())
+    engine = ContentDiscoveryEngine(llm_service=llm)
+
+    # A full default 45-item batch must get far more than the old fixed
+    # 1024 budget, and a hard-cap 90-item batch must hit the 4096 ceiling.
+    await engine.tag_content_batch(_untagged_contents(45), batch_size=45)
+    assert llm.calls[0]["max_tokens"] == 256 + 64 * 45
+
+    capped_llm = _RecordingTagLLM(_three_item_payload())
+    capped_engine = ContentDiscoveryEngine(llm_service=capped_llm)
+    await capped_engine.tag_content_batch(_untagged_contents(90), batch_size=90)
+    assert capped_llm.calls[0]["max_tokens"] == 4096
 
 
 async def test_tag_content_batch_does_not_cache_failed_results() -> None:
@@ -250,6 +272,7 @@ class _TagAndEvalEngine:
         self.eval_calls = 0
         self.fail_tag = fail_tag
         self.tagged_bvids: list[str] = []
+        self.tag_kwargs: list[dict[str, object]] = []
 
     async def tag_content_batch(
         self,
@@ -257,6 +280,7 @@ class _TagAndEvalEngine:
         **kwargs: object,
     ) -> list[DiscoveredContent]:
         self.tag_calls += 1
+        self.tag_kwargs.append(dict(kwargs))
         if self.fail_tag:
             raise RuntimeError("tag-channel down")
         for item in items:
@@ -335,6 +359,10 @@ async def test_evaluate_claim_enforce_tags_then_still_evaluates() -> None:
     assert engine.tagged_bvids == ["BV1A", "BV1B"]
     assert [row["candidate_id"] for row in db.rows] == [11, 12]
     assert claim.items[0].tag_channel_source == "llm"
+    # The pipeline must not override batch_size: untagged claims can reach
+    # the evaluate hard cap (90) and one giant call would blow the tag
+    # channel's output token budget.
+    assert engine.tag_kwargs == [{}]
 
 
 async def test_evaluate_claim_enforce_skips_already_tagged_items() -> None:

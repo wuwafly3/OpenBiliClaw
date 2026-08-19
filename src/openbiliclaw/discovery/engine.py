@@ -213,10 +213,13 @@ _DEFAULT_EVAL_BATCH_SIZE: int = 45
 _DEFAULT_TAG_BATCH_SIZE: int = 45
 _DEFAULT_EVAL_BATCH_CONCURRENCY: int = 2
 _EVAL_CACHE_MAX_ENTRIES: int = 4096
-# Tags-only JSON is much shorter than full eval. Gateways that still spend
-# thinking tokens (OpenAI-typed DeepSeek relays) can empty 1024; reopen if
-# live probes show empty content or truncation.
-_TAG_CHANNEL_MAX_TOKENS: int = 1024
+# Tags-only JSON is much shorter than full eval, but each result row still
+# costs ~40-60 output tokens and gateways that spend thinking tokens can
+# drain a fixed budget. Scale the allowance with batch size so a full
+# 45-item (or hard-cap 90-item) batch is not truncated mid-JSON.
+_TAG_CHANNEL_TOKENS_BASE: int = 256
+_TAG_CHANNEL_TOKENS_PER_ITEM: int = 64
+_TAG_CHANNEL_MAX_TOKENS_CAP: int = 4096
 _TAG_CHANNEL_CACHE_VERSION = "tag-channel-v1"
 _TAG_CHANNEL_CACHE_MAX_ENTRIES: int = 4096
 _TAG_CHANNEL_CALLER = "discovery.tag_batch"
@@ -224,6 +227,13 @@ _TAG_CHANNEL_MODES = frozenset({"off", "shadow", "enforce"})
 _RELEVANCE_SCORER_MODES = frozenset({"llm", "shadow", "ml"})
 _TagChannelCacheEntry = tuple[str, str, str, str]
 _LLM_EVAL_OVERSAMPLE_FACTOR: int = 2
+
+
+def _tag_channel_max_tokens(item_count: int) -> int:
+    return min(
+        _TAG_CHANNEL_MAX_TOKENS_CAP,
+        _TAG_CHANNEL_TOKENS_BASE + _TAG_CHANNEL_TOKENS_PER_ITEM * max(1, item_count),
+    )
 
 
 def _namespaced_storage_identity(value: str) -> tuple[str, str] | None:
@@ -243,6 +253,17 @@ _LLM_EVAL_MIN_WINDOW: int = 6
 _RAW_CANDIDATE_MODE: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "openbiliclaw_discovery_raw_candidate_mode",
     default=False,
+)
+# In-flight evaluations bind their frozen snapshot per task so concurrent
+# evaluate_content / evaluate_content_batch calls on one engine never see
+# each other's profile. Asyncio tasks copy the context at spawn, so batch
+# workers inherit the snapshot and a parent's unbind cannot yank it away
+# from still-running children.
+_EVALUATION_CONTEXT_OVERRIDE: contextvars.ContextVar[EvaluationContextSnapshot | None] = (
+    contextvars.ContextVar(
+        "openbiliclaw_discovery_evaluation_context_override",
+        default=None,
+    )
 )
 _EVAL_BATCH_CACHE_VERSION = "content-eval-v6"
 _EMBEDDING_PREFILTER_DEFAULT_MODE = "shadow"
@@ -1352,6 +1373,9 @@ class ContentDiscoveryEngine:
         self._negative_exemplars_cache: tuple[float, int | None, list[dict[str, object]]] | None = (
             None
         )
+        # Replay-only injection point for the self-consistency probe and
+        # tests: a frozen snapshot set here wins whenever no task-scoped
+        # ContextVar override is bound. Live evaluation never touches it.
         self._evaluation_context_override: EvaluationContextSnapshot | None = None
 
     def _eval_cache_store(self) -> OrderedDict[str, _EvalCacheEntry]:
@@ -2408,7 +2432,7 @@ class ContentDiscoveryEngine:
         if self._llm_service is None:
             return 0.0
 
-        snapshot, owns_context = self._bind_evaluation_context(profile)
+        snapshot, context_token = self._bind_evaluation_context(profile)
         try:
             return await self._evaluate_content_with_context(
                 content,
@@ -2417,7 +2441,7 @@ class ContentDiscoveryEngine:
                 source_context=source_context,
             )
         finally:
-            self._unbind_evaluation_context(owns_context)
+            self._unbind_evaluation_context(context_token)
 
     async def _evaluate_content_with_context(
         self,
@@ -2696,13 +2720,15 @@ class ContentDiscoveryEngine:
         contents: list[DiscoveredContent],
         *,
         batch_size: int = _DEFAULT_TAG_BATCH_SIZE,
-        max_tokens: int = _TAG_CHANNEL_MAX_TOKENS,
+        max_tokens: int | None = None,
     ) -> list[DiscoveredContent]:
         """Label topic/style/temporal via the cheap tags-only channel.
 
         Writes only ``tag_channel_*`` on each item. Teacher score/tags and
         admission are unchanged. Empty or unparseable provider results are
-        not cached.
+        not cached. Unless ``max_tokens`` is set explicitly, the output
+        allowance scales with each chunk's size so large batches are not
+        truncated mid-JSON.
         """
         if self._llm_service is None or not contents:
             return contents
@@ -2713,24 +2739,26 @@ class ContentDiscoveryEngine:
         if not pending:
             return contents
         effective_batch_size = max(1, int(batch_size or _DEFAULT_TAG_BATCH_SIZE))
-        effective_max_tokens = max(16, int(max_tokens or _TAG_CHANNEL_MAX_TOKENS))
         for start in range(0, len(pending), effective_batch_size):
             chunk = pending[start : start + effective_batch_size]
-            await self._tag_batch_once(chunk, max_tokens=effective_max_tokens)
+            chunk_max_tokens = (
+                max(16, int(max_tokens)) if max_tokens else _tag_channel_max_tokens(len(chunk))
+            )
+            await self._tag_batch_once(chunk, max_tokens=chunk_max_tokens)
             missing = [
                 item
                 for item in chunk
                 if str(item.tag_channel_source or "").strip().lower() != TAG_CHANNEL_SOURCE_LLM
             ]
             if missing:
-                await self._tag_batch_once(missing, max_tokens=effective_max_tokens)
+                await self._tag_batch_once(missing, max_tokens=chunk_max_tokens)
         return contents
 
     async def _tag_batch_once(
         self,
         batch: list[DiscoveredContent],
         *,
-        max_tokens: int = _TAG_CHANNEL_MAX_TOKENS,
+        max_tokens: int,
     ) -> None:
         from openbiliclaw.llm.prompts import build_batch_tag_prompt
 
@@ -2744,7 +2772,7 @@ class ContentDiscoveryEngine:
         kwargs: dict[str, Any] = {
             "system_instruction": messages[0]["content"],
             "user_input": messages[1]["content"],
-            "max_tokens": max(16, int(max_tokens or _TAG_CHANNEL_MAX_TOKENS)),
+            "max_tokens": max(16, int(max_tokens or 16)),
             "caller": _TAG_CHANNEL_CALLER,
         }
         if call_accepts_keyword(complete_structured, "reasoning_effort"):
@@ -2801,7 +2829,7 @@ class ContentDiscoveryEngine:
         if self._llm_service is None or not contents:
             return [0.0] * len(contents)
 
-        snapshot, owns_context = self._bind_evaluation_context(profile)
+        snapshot, context_token = self._bind_evaluation_context(profile)
         try:
             return await self._evaluate_content_batch_with_context(
                 contents,
@@ -2811,7 +2839,7 @@ class ContentDiscoveryEngine:
                 batch_size=batch_size,
             )
         finally:
-            self._unbind_evaluation_context(owns_context)
+            self._unbind_evaluation_context(context_token)
 
     async def _evaluate_content_batch_with_context(
         self,
@@ -3357,7 +3385,12 @@ class ContentDiscoveryEngine:
         return exemplars
 
     def _bound_evaluation_context(self) -> EvaluationContextSnapshot | None:
-        override = getattr(self, "_evaluation_context_override", None)
+        # Task-scoped binding (set by _bind_evaluation_context) wins so
+        # concurrent evaluations on one engine stay isolated; the instance
+        # attribute is only a replay hook for probes/tests.
+        override = _EVALUATION_CONTEXT_OVERRIDE.get()
+        if override is None:
+            override = getattr(self, "_evaluation_context_override", None)
         return override if isinstance(override, EvaluationContextSnapshot) else None
 
     def _get_negative_exemplars(self) -> list[dict[str, object]] | None:
@@ -3410,17 +3443,22 @@ class ContentDiscoveryEngine:
 
     def _bind_evaluation_context(
         self, profile: SoulProfile
-    ) -> tuple[EvaluationContextSnapshot, bool]:
+    ) -> tuple[
+        EvaluationContextSnapshot, contextvars.Token[EvaluationContextSnapshot | None] | None
+    ]:
         existing = self._bound_evaluation_context()
         if existing is not None:
-            return existing, False
+            return existing, None
         snapshot = self._build_live_evaluation_context(profile)
-        self._evaluation_context_override = snapshot
-        return snapshot, True
+        token = _EVALUATION_CONTEXT_OVERRIDE.set(snapshot)
+        return snapshot, token
 
-    def _unbind_evaluation_context(self, owns: bool) -> None:
-        if owns:
-            self._evaluation_context_override = None
+    def _unbind_evaluation_context(
+        self,
+        token: contextvars.Token[EvaluationContextSnapshot | None] | None,
+    ) -> None:
+        if token is not None:
+            _EVALUATION_CONTEXT_OVERRIDE.reset(token)
 
     def _remember_evaluation_context(self, snapshot: EvaluationContextSnapshot) -> None:
         database = getattr(self, "_database", None)
