@@ -37,6 +37,8 @@
    （决定 S1.8 成本模型与验收线）+ 通道输出落库 schema
    （`discovery_candidates` 标注列 + 标注来源标记）。
    依据：tags oracle 消融 Δρ=+0.111（`docs/plans/2026-08-16-ml-tags-ablation-probe.md`）。
+   可执行切片：[`2026-08-19-ml-wave1-tags-channel-spec.md`](./2026-08-19-ml-wave1-tags-channel-spec.md)
+   / [`2026-08-19-ml-wave1-tags-channel-plan.md`](./2026-08-19-ml-wave1-tags-channel-plan.md)。
 1. `ml/features.py`：确定性纯函数特征提取（spec S1.2 特征集，
    含候选文本向量降维投影 ≤32 维——pairwise 原型实测当前特征集的教师
    排序复现上限 ρ≈0.46 / 准入 AUC≈0.72–0.80，文本向量本体是下一特征杠杆；
