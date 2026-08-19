@@ -55,6 +55,7 @@ from openbiliclaw.discovery.strategies._utils import (
     compact_content_prompt_profile_summary,
 )
 from openbiliclaw.discovery.style_keys import normalize_style_key
+from openbiliclaw.discovery.tag_channel import TAG_CHANNEL_SOURCE_LLM, parse_tag_channel_payload
 from openbiliclaw.discovery.temporal import (
     TEMPORAL_POLICY_VERSION,
     TemporalEvaluation,
@@ -75,7 +76,7 @@ from openbiliclaw.llm.prompt_cache import (
     profile_prompt_layers,
     stable_json_digest,
 )
-from openbiliclaw.llm.task_options import without_core_memory_kwargs
+from openbiliclaw.llm.task_options import call_accepts_keyword, without_core_memory_kwargs
 from openbiliclaw.saved_sync.identity import (
     canonical_source_platform,
     content_storage_key,
@@ -203,8 +204,18 @@ _CANONICAL_STORAGE_KEY_PLATFORMS = frozenset(
 )
 _EVALUATE_BATCH_HARD_CAP_DEFAULT: int = 90
 _DEFAULT_EVAL_BATCH_SIZE: int = 45
+_DEFAULT_TAG_BATCH_SIZE: int = 45
 _DEFAULT_EVAL_BATCH_CONCURRENCY: int = 2
 _EVAL_CACHE_MAX_ENTRIES: int = 4096
+# Tags-only JSON is much shorter than full eval. Gateways that still spend
+# thinking tokens (OpenAI-typed DeepSeek relays) can empty 1024; reopen if
+# live probes show empty content or truncation.
+_TAG_CHANNEL_MAX_TOKENS: int = 1024
+_TAG_CHANNEL_CACHE_VERSION = "tag-channel-v1"
+_TAG_CHANNEL_CACHE_MAX_ENTRIES: int = 4096
+_TAG_CHANNEL_CALLER = "discovery.tag_batch"
+_TAG_CHANNEL_MODES = frozenset({"off", "shadow", "enforce"})
+_TagChannelCacheEntry = tuple[str, str, str, str]
 _LLM_EVAL_OVERSAMPLE_FACTOR: int = 2
 
 
@@ -674,6 +685,46 @@ def _content_result_keys(content: DiscoveredContent) -> set[str]:
     }
 
 
+def _tag_channel_prompt_item(content: DiscoveredContent) -> dict[str, object]:
+    item: dict[str, object] = {
+        "title": str(content.title or ""),
+        "description": str(content.description or ""),
+        "body_text": str(content.body_text or ""),
+        "source_platform": str(content.source_platform or "bilibili"),
+        "content_type": str(content.content_type or ""),
+        "duration": int(content.duration or 0),
+        "published_at": str(content.published_at or ""),
+    }
+    bvid = str(content.bvid or "").strip()
+    content_id = str(content.content_id or "").strip()
+    if bvid:
+        item["bvid"] = bvid
+    if content_id:
+        item["content_id"] = content_id
+    return item
+
+
+def _tag_channel_cache_key(content: DiscoveredContent) -> str:
+    identity = str(content.item_key or content.bvid or content.content_id or "").strip()
+    title = str(content.title or "").strip()
+    description = str(content.description or "")[:80]
+    body = str(content.body_text or "")[:80]
+    return f"{_TAG_CHANNEL_CACHE_VERSION}:{identity}:{title}:{description}:{body}"
+
+
+def _apply_tag_channel_row(
+    content: DiscoveredContent,
+    row: dict[str, str],
+    *,
+    model: str,
+) -> None:
+    content.tag_channel_topic_group = row["topic_group"]
+    content.tag_channel_style_key = row["style_key"]
+    content.tag_channel_temporal_class = row["temporal_class"]
+    content.tag_channel_source = TAG_CHANNEL_SOURCE_LLM
+    content.tag_channel_model = model
+
+
 _PROMPT_VISIBLE_METRIC_FIELDS: tuple[str, ...] = (
     "view_count",
     "like_count",
@@ -888,6 +939,13 @@ class DiscoveredContent:
     # window stay auditable; mixing teachers is a real variance source
     # (measured batch drift std 0.114 ≈ within-batch 0.137).
     teacher_model: str = ""
+    # Cheap tags-only channel (Wave 1). Isolated from teacher topic/style/
+    # temporal so ML features can exist before full ``evaluate_batch``.
+    tag_channel_topic_group: str = ""
+    tag_channel_style_key: str = ""
+    tag_channel_temporal_class: str = "unknown"
+    tag_channel_source: str = ""
+    tag_channel_model: str = ""
     temporal_class: str = "unknown"  # Why this content's value may expire
     temporal_confidence: float = 0.0  # Evaluator confidence in temporal_class
     temporal_reason: str = ""  # Short diagnostic for the temporal classification
@@ -1223,6 +1281,7 @@ class ContentDiscoveryEngine:
         multimodal_vision_supported: bool | None = None,
         eval_batch_concurrency: int = _DEFAULT_EVAL_BATCH_CONCURRENCY,
         eval_prefilter_mode: str = _EMBEDDING_PREFILTER_DEFAULT_MODE,
+        tag_channel_mode: str = "off",
         compact_evaluation_json: bool = False,
         evaluation_candidate_transport: str = _DEFAULT_EVALUATION_CANDIDATE_TRANSPORT,
     ) -> None:
@@ -1243,6 +1302,7 @@ class ContentDiscoveryEngine:
         )
         self.eval_batch_concurrency = max(1, min(16, int(eval_batch_concurrency)))
         self.eval_prefilter_mode = self._normalize_eval_prefilter_mode(eval_prefilter_mode)
+        self.tag_channel_mode = self._normalize_tag_channel_mode(tag_channel_mode)
         # Replay-only unless and until the real provider quality/token gate
         # approves compact deterministic evaluator JSON.
         self.compact_evaluation_json = bool(compact_evaluation_json)
@@ -1260,6 +1320,7 @@ class ContentDiscoveryEngine:
         self._multimodal_vision_supported_override = multimodal_vision_supported
         self.multimodal_unavailable_reason = ""
         self._eval_cache: OrderedDict[str, _EvalCacheEntry] = OrderedDict()
+        self._tag_channel_cache: OrderedDict[str, _TagChannelCacheEntry] = OrderedDict()
         self._evaluation_profile_prompt_cache = PromptLayerRenderCache()
         # v0.3.x negative-anchors cache: (timestamp, latest_event_id,
         # exemplars). Refreshes when either the latest event id changes
@@ -1298,6 +1359,13 @@ class ContentDiscoveryEngine:
         if normalized in _EMBEDDING_PREFILTER_MODES:
             return normalized
         return _EMBEDDING_PREFILTER_DEFAULT_MODE
+
+    @staticmethod
+    def _normalize_tag_channel_mode(mode: str) -> str:
+        normalized = str(mode or "").strip().lower()
+        if normalized in _TAG_CHANNEL_MODES:
+            return normalized
+        return "off"
 
     @staticmethod
     def _embedding_prefilter_content_text(content: DiscoveredContent) -> str:
@@ -2383,6 +2451,139 @@ class ContentDiscoveryEngine:
     # (~30s each), three parallel batches finish in roughly the same
     # wall time as one used to take.
     _EVALUATE_BATCH_HARD_CAP = _EVALUATE_BATCH_HARD_CAP_DEFAULT
+
+    def _tag_channel_cache_store(self) -> OrderedDict[str, _TagChannelCacheEntry]:
+        cache = self._tag_channel_cache
+        if not isinstance(cache, OrderedDict):
+            cache = OrderedDict(cache)
+            self._tag_channel_cache = cache
+        return cache
+
+    def _get_tag_channel_cache_entry(self, cache_key: str) -> _TagChannelCacheEntry | None:
+        cache = self._tag_channel_cache_store()
+        cached = cache.get(cache_key)
+        if cached is None:
+            return None
+        cache.move_to_end(cache_key)
+        return cached
+
+    def _set_tag_channel_cache_entry(self, cache_key: str, entry: _TagChannelCacheEntry) -> None:
+        cache = self._tag_channel_cache_store()
+        cache[cache_key] = entry
+        cache.move_to_end(cache_key)
+        while len(cache) > _TAG_CHANNEL_CACHE_MAX_ENTRIES:
+            cache.popitem(last=False)
+
+    def _apply_cached_tag_channel(self, content: DiscoveredContent) -> bool:
+        cached = self._get_tag_channel_cache_entry(_tag_channel_cache_key(content))
+        if cached is None:
+            return False
+        topic_group, style_key, temporal_class, model = cached
+        content.tag_channel_topic_group = topic_group
+        content.tag_channel_style_key = style_key
+        content.tag_channel_temporal_class = temporal_class
+        content.tag_channel_source = TAG_CHANNEL_SOURCE_LLM
+        content.tag_channel_model = model
+        return True
+
+    def _remember_tag_channel(self, content: DiscoveredContent) -> None:
+        if str(content.tag_channel_source or "").strip().lower() != TAG_CHANNEL_SOURCE_LLM:
+            return
+        self._set_tag_channel_cache_entry(
+            _tag_channel_cache_key(content),
+            (
+                content.tag_channel_topic_group,
+                content.tag_channel_style_key,
+                content.tag_channel_temporal_class,
+                content.tag_channel_model,
+            ),
+        )
+
+    async def tag_content_batch(
+        self,
+        contents: list[DiscoveredContent],
+        *,
+        batch_size: int = _DEFAULT_TAG_BATCH_SIZE,
+        max_tokens: int = _TAG_CHANNEL_MAX_TOKENS,
+    ) -> list[DiscoveredContent]:
+        """Label topic/style/temporal via the cheap tags-only channel.
+
+        Writes only ``tag_channel_*`` on each item. Teacher score/tags and
+        admission are unchanged. Empty or unparseable provider results are
+        not cached.
+        """
+        if self._llm_service is None or not contents:
+            return contents
+        pending: list[DiscoveredContent] = []
+        for content in contents:
+            if not self._apply_cached_tag_channel(content):
+                pending.append(content)
+        if not pending:
+            return contents
+        effective_batch_size = max(1, int(batch_size or _DEFAULT_TAG_BATCH_SIZE))
+        effective_max_tokens = max(16, int(max_tokens or _TAG_CHANNEL_MAX_TOKENS))
+        for start in range(0, len(pending), effective_batch_size):
+            chunk = pending[start : start + effective_batch_size]
+            await self._tag_batch_once(chunk, max_tokens=effective_max_tokens)
+            missing = [
+                item
+                for item in chunk
+                if str(item.tag_channel_source or "").strip().lower() != TAG_CHANNEL_SOURCE_LLM
+            ]
+            if missing:
+                await self._tag_batch_once(missing, max_tokens=effective_max_tokens)
+        return contents
+
+    async def _tag_batch_once(
+        self,
+        batch: list[DiscoveredContent],
+        *,
+        max_tokens: int = _TAG_CHANNEL_MAX_TOKENS,
+    ) -> None:
+        from openbiliclaw.llm.prompts import build_batch_tag_prompt
+
+        if not batch:
+            return
+        assert self._llm_service is not None
+        messages = build_batch_tag_prompt(
+            content_items=[_tag_channel_prompt_item(item) for item in batch]
+        )
+        complete_structured = self._llm_service.complete_structured_task
+        kwargs: dict[str, Any] = {
+            "system_instruction": messages[0]["content"],
+            "user_input": messages[1]["content"],
+            "max_tokens": max(16, int(max_tokens or _TAG_CHANNEL_MAX_TOKENS)),
+            "caller": _TAG_CHANNEL_CALLER,
+        }
+        if call_accepts_keyword(complete_structured, "reasoning_effort"):
+            kwargs["reasoning_effort"] = ""
+        if call_accepts_keyword(complete_structured, "json_mode"):
+            kwargs["json_mode"] = True
+        kwargs.update(without_core_memory_kwargs(complete_structured))
+        llm_call = complete_structured(**kwargs)
+        if self._concurrency is not None:
+            response = await self._concurrency.run_llm(llm_call)
+        else:
+            response = await llm_call
+        raw = str(getattr(response, "content", "") or "").strip()
+        parsed = parse_tag_channel_payload(raw)
+        if not parsed:
+            logger.warning(
+                "tag-channel batch returned no parseable tags for %d item(s)",
+                len(batch),
+            )
+            return
+        by_id = {row["item_id"]: row for row in parsed}
+        model = _response_teacher_identity(response)
+        for content in batch:
+            row = next(
+                (by_id[key] for key in _content_result_keys(content) if key in by_id),
+                None,
+            )
+            if row is None:
+                continue
+            _apply_tag_channel_row(content, row, model=model)
+            self._remember_tag_channel(content)
 
     async def evaluate_content_batch(
         self,

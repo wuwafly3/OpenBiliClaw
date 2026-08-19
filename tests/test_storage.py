@@ -1722,6 +1722,90 @@ class TestDatabase:
         assert stored["temporal_policy_version"] == "v1"
         db.close()
 
+    def test_update_discovery_candidate_tag_channel_does_not_touch_teacher_columns(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "test.db")
+            db.initialize()
+            db.enqueue_discovery_candidates(
+                [
+                    DiscoveryCandidateWrite(
+                        candidate_key="bilibili:BV1TAGISO",
+                        source_platform="bilibili",
+                        source_strategy="search",
+                        content_id="BV1TAGISO",
+                        title="Tag isolation candidate",
+                    )
+                ]
+            )
+            claimed = db.claim_discovery_candidates_for_eval(limit=1)[0]
+            assert (
+                db.update_discovery_candidate_evaluations(
+                    [
+                        {
+                            "candidate_id": claimed["id"],
+                            "status": "evaluated",
+                            "topic_group": "人工智能",
+                            "style_key": "deep_focus",
+                            "temporal_class": "evergreen",
+                            "relevance_score": 0.72,
+                            "score_source": "llm",
+                            "llm_score_raw": 0.72,
+                            "teacher_model": "openai/deepseek-v4-flash",
+                        }
+                    ]
+                )
+                == 1
+            )
+            before = dict(
+                db.conn.execute(
+                    "SELECT topic_group, style_key, temporal_class, score_source, "
+                    "llm_score_raw, teacher_model, relevance_score "
+                    "FROM discovery_candidates WHERE id = ?",
+                    (claimed["id"],),
+                ).fetchone()
+            )
+            assert before["topic_group"] == "人工智能"
+            assert before["style_key"] == "deep_focus"
+            assert before["score_source"] == "llm"
+            assert before["llm_score_raw"] == pytest.approx(0.72)
+            assert (
+                db.update_discovery_candidate_tag_channel(
+                    [
+                        {
+                            "candidate_id": claimed["id"],
+                            "tag_channel_topic_group": "机器学习",
+                            "tag_channel_style_key": "quick_scan",
+                            "tag_channel_temporal_class": "current",
+                            "tag_channel_source": "llm",
+                            "tag_channel_model": "openai/deepseek-v4-flash",
+                        }
+                    ]
+                )
+                == 1
+            )
+            stored = dict(
+                db.conn.execute(
+                    "SELECT * FROM discovery_candidates WHERE id = ?",
+                    (claimed["id"],),
+                ).fetchone()
+            )
+            assert stored["topic_group"] == before["topic_group"]
+            assert stored["style_key"] == before["style_key"]
+            assert stored["temporal_class"] == before["temporal_class"]
+            assert stored["score_source"] == before["score_source"]
+            assert stored["llm_score_raw"] == before["llm_score_raw"]
+            assert stored["teacher_model"] == before["teacher_model"]
+            assert stored["relevance_score"] == before["relevance_score"]
+            assert stored["tag_channel_topic_group"] == "机器学习"
+            assert stored["tag_channel_style_key"] == "quick_scan"
+            assert stored["tag_channel_temporal_class"] == "current"
+            assert stored["tag_channel_source"] == "llm"
+            assert stored["tag_channel_model"] == "openai/deepseek-v4-flash"
+            assert stored["tag_channel_at"]
+            db.close()
+
     def test_initialize_creates_recommendation_read_indexes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db = Database(Path(tmpdir) / "test.db")

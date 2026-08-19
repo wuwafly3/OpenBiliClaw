@@ -360,6 +360,7 @@ _EXPRESSION_CALLERS = {
 _EVALUATION_CALLERS = {
     "discovery.evaluate_batch",
     "discovery.evaluate_single",
+    "discovery.tag_batch",
     "recommendation.evaluate_batch",
 }
 _SUPPLY_PREFIXES = (

@@ -151,6 +151,8 @@ _DEFAULT_CANDIDATE_EVAL_CONCURRENCY = 3
 _MIN_ADMISSION_MIN_SCORE = 0.50
 _DEFAULT_EVAL_PREFILTER_MODE = "shadow"
 _SUPPORTED_EVAL_PREFILTER_MODES = {"off", "shadow", "enforce"}
+_DEFAULT_TAG_CHANNEL_MODE = "off"
+_SUPPORTED_TAG_CHANNEL_MODES = {"off", "shadow", "enforce"}
 _DEFAULT_MULTIMODAL_BATCH_SIZE = 8
 _DEFAULT_MULTIMODAL_IMAGE_MAX_PX = 384
 _DEFAULT_MULTIMODAL_IMAGE_QUALITY = 72
@@ -1079,6 +1081,10 @@ class DiscoveryConfig:
     # Embedding pre-filter rollout for discovery evaluation. ``shadow`` logs
     # would-be filtered candidates without suppressing LLM evaluation.
     eval_prefilter_mode: str = _DEFAULT_EVAL_PREFILTER_MODE
+    # Cheap tags-only LLM channel for Wave 1 ML features. ``off`` makes zero
+    # extra calls. ``shadow`` is a backfill/probe path, not the claim hot path.
+    # ``enforce`` tags pending_eval before full eval still runs.
+    tag_channel_mode: str = _DEFAULT_TAG_CHANNEL_MODE
     # Optional cover-image evaluation. Kept off by default because it changes
     # LLM cost/latency and requires a vision-capable evaluation model.
     multimodal_evaluation_enabled: bool = False
@@ -2693,6 +2699,7 @@ def _build_discovery(discovery_raw: dict[str, Any]) -> DiscoveryConfig:
         eval_prefilter_mode=_normalize_eval_prefilter_mode(
             discovery_raw.get("eval_prefilter_mode")
         ),
+        tag_channel_mode=_normalize_tag_channel_mode(discovery_raw.get("tag_channel_mode")),
         multimodal_evaluation_enabled=_coerce_bool(
             discovery_raw.get("multimodal_evaluation_enabled"),
             default=False,
@@ -2780,6 +2787,13 @@ def _normalize_eval_prefilter_mode(value: object) -> str:
         return _DEFAULT_EVAL_PREFILTER_MODE
     mode = value.strip().lower()
     return mode or _DEFAULT_EVAL_PREFILTER_MODE
+
+
+def _normalize_tag_channel_mode(value: object) -> str:
+    if not isinstance(value, str):
+        return _DEFAULT_TAG_CHANNEL_MODE
+    mode = value.strip().lower()
+    return mode or _DEFAULT_TAG_CHANNEL_MODE
 
 
 def _coerce_bool(value: object, *, default: bool = False) -> bool:
@@ -4229,6 +4243,16 @@ def _collect_config_issues(config: Config) -> list[ConfigIssue]:
             )
         )
 
+    tag_channel_mode = str(config.discovery.tag_channel_mode or "").strip().lower()
+    if tag_channel_mode not in _SUPPORTED_TAG_CHANNEL_MODES:
+        issues.append(
+            ConfigIssue(
+                field="discovery.tag_channel_mode",
+                message='`discovery.tag_channel_mode` 仅支持: "off", "shadow", "enforce"。',
+                severity="blocking",
+            )
+        )
+
     return issues
 
 
@@ -5260,6 +5284,7 @@ def _render_config_toml(
             f"{_toml_bool(config.discovery.inspiration_replace_merged_keywords)}",
             f"inspiration_breadth = {_toml_string(config.discovery.inspiration_breadth)}",
             f"eval_prefilter_mode = {_toml_string(config.discovery.eval_prefilter_mode)}",
+            f"tag_channel_mode = {_toml_string(config.discovery.tag_channel_mode)}",
             "multimodal_evaluation_enabled = "
             f"{_toml_bool(config.discovery.multimodal_evaluation_enabled)}",
             f"visual_profile_enabled = {_toml_bool(config.discovery.visual_profile_enabled)}",

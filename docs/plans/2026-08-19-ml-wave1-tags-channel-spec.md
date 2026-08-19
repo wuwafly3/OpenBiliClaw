@@ -137,10 +137,11 @@ scope** here.
 ### Phase 0 — Prompt and parser
 
 - New builder `build_batch_tag_prompt` in `src/openbiliclaw/llm/prompts.py`.
-- System constant `_BATCH_TAG_SYSTEM_PROMPT`: output JSON object with
-  `results` array; each item returns input `bvid`/`content_id`,
-  `topic_group`, `style_key`, `temporal_class`. No score, reason,
-  franchise, or temporal v2 fields.
+- System constant `_BATCH_TAG_SYSTEM_PROMPT`: say only what to emit —
+  JSON `results` with input `bvid`/`content_id`, `topic_group`,
+  `style_key`, `temporal_class` and their taxonomies. Do not list
+  score / reason / franchise / temporal-v2 as forbidden fields; the
+  parser already drops extras.
 - User message: candidate block only (title, description, optional
   truncated body, `source_platform`, `content_type`, duration,
   `published_at`). **No profile, no negatives, no source_context rubric.**

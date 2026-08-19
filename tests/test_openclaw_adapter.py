@@ -899,7 +899,6 @@ async def test_submit_feedback_records_event_and_cognition_returns_queued() -> N
     # background schedulers, so submit_feedback no longer calls them here.
 
 
-
 @pytest.mark.asyncio
 async def test_submit_feedback_keeps_commit_success_when_cognition_fails() -> None:
     adapter, soul_engine, memory, database, *_ = _build_adapter()
@@ -1125,11 +1124,13 @@ def test_build_openclaw_adapter_services_reuses_shared_database(
             embedding_service: object = None,
             concurrency: object = None,
             eval_prefilter_mode: str = "shadow",
+            tag_channel_mode: str = "off",
         ) -> None:
             self.llm_service = llm_service
             self.database = database
             self.concurrency = concurrency
             self.eval_prefilter_mode = eval_prefilter_mode
+            self.tag_channel_mode = tag_channel_mode
 
         def register_strategy(self, strategy: object) -> None:
             registered_strategies.append(str(getattr(strategy, "name", "")))
@@ -1287,6 +1288,7 @@ def test_build_openclaw_adapter_services_reuses_shared_database(
     assert services.llm_service.concurrency == 3
     assert services.discovery_engine.concurrency.llm_evaluation_concurrency == 2
     assert services.discovery_engine.eval_prefilter_mode == "enforce"
+    assert services.discovery_engine.tag_channel_mode == "off"
     assert services.recommendation_engine.kwargs["copy_ready_target_count"] == (
         expected_copy_target
     )

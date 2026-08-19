@@ -1023,6 +1023,20 @@ def _builder_test_inputs() -> list[tuple[str, dict, dict]]:
             ),
         ),
         (
+            "build_batch_tag_prompt",
+            dict(content_items=[{"bvid": "BV1A", "title": "A", "description": "one"}]),
+            dict(
+                content_items=[
+                    {
+                        "bvid": "BV1B",
+                        "title": "B",
+                        "description": "two",
+                        "source_platform": "xiaohongshu",
+                    }
+                ]
+            ),
+        ),
+        (
             "build_content_evaluation_prompt",
             dict(
                 profile_summary={"a": 1},

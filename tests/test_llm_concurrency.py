@@ -411,6 +411,7 @@ def test_inventory_state_drives_dynamic_supply_classification() -> None:
     assert all(gate.classify(caller) is LLMTrafficClass.REFILL_SUPPLY for caller in supply_callers)
     assert gate.classify("recommendation.write_expression") is LLMTrafficClass.REFILL_EXPRESSION
     assert gate.classify("discovery.evaluate_batch") is LLMTrafficClass.REFILL_EVALUATION
+    assert gate.classify("discovery.tag_batch") is LLMTrafficClass.REFILL_EVALUATION
     assert gate.classify("soul.preference") is LLMTrafficClass.MAINTENANCE
 
 
@@ -448,6 +449,7 @@ async def test_refill_class_order_is_expression_then_evaluation_then_supply() ->
         "discovery.douyin.keyword_gen",
         "discovery.evaluate_batch",
         "discovery.evaluate_single",
+        "discovery.tag_batch",
         "discovery.explore.queries",
         "discovery.keyword_inspiration",
         "discovery.keyword_planner",

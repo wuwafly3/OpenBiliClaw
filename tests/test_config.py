@@ -2771,6 +2771,7 @@ class TestDiscoveryConfig:
         )
         assert config.discovery.inspiration_breadth == "high"
         assert config.discovery.eval_prefilter_mode == "shadow"
+        assert config.discovery.tag_channel_mode == "off"
         assert config.discovery.multimodal_evaluation_enabled is False
         assert config.discovery.visual_profile_enabled is False
         assert config.discovery.keyframe_enabled is False
@@ -2803,6 +2804,7 @@ class TestDiscoveryConfig:
         )
         assert config.discovery.inspiration_breadth == "high"
         assert config.discovery.eval_prefilter_mode == "shadow"
+        assert config.discovery.tag_channel_mode == "off"
         assert config.discovery.multimodal_evaluation_enabled is False
         assert config.discovery.visual_profile_enabled is False
         assert config.discovery.keyframe_enabled is False
@@ -2815,6 +2817,8 @@ class TestDiscoveryConfig:
         with example_path.open("rb") as handle:
             example = tomllib.load(handle)
 
+        assert example["discovery"]["eval_prefilter_mode"] == "shadow"
+        assert example["discovery"]["tag_channel_mode"] == "off"
         assert example["discovery"]["inspiration_search_enabled"] is True
         assert example["discovery"]["inspiration_replace_merged_keywords"] is False
         assert example["discovery"]["multimodal_evaluation_enabled"] is False
@@ -3036,6 +3040,29 @@ eval_prefilter_mode = "  Shadow  "
         with pytest.raises(ConfigError, match="discovery\\.eval_prefilter_mode"):
             validate_runtime_config(config)
 
+    def test_discovery_tag_channel_mode_normalizes_from_toml(self, tmp_path: Path) -> None:
+        toml_path = tmp_path / "c.toml"
+        toml_path.write_text(
+            """
+[discovery]
+tag_channel_mode = "  Enforce  "
+""".strip(),
+            encoding="utf-8",
+        )
+
+        config = load_config(toml_path)
+
+        assert config.discovery.tag_channel_mode == "enforce"
+
+    def test_validate_runtime_config_rejects_invalid_tag_channel_mode(self) -> None:
+        config = Config()
+        config.llm.default_provider = "ollama"
+        config.llm.ollama.model = "qwen2.5:7b"
+        config.discovery.tag_channel_mode = "always"
+
+        with pytest.raises(ConfigError, match="discovery\\.tag_channel_mode"):
+            validate_runtime_config(config)
+
     def test_discovery_missing_table_uses_defaults(self, tmp_path: Path) -> None:
         toml_path = tmp_path / "c.toml"
         toml_path.write_text("[scheduler]\nenabled = true\n", encoding="utf-8")
@@ -3133,6 +3160,7 @@ eval_prefilter_mode = "  Shadow  "
         assert loaded.discovery.inspiration_search_backends == ("you",)
         assert loaded.discovery.inspiration_breadth == "low"
         assert loaded.discovery.eval_prefilter_mode == "enforce"
+        assert loaded.discovery.tag_channel_mode == "off"
         assert loaded.discovery.multimodal_evaluation_enabled is True
         assert loaded.discovery.multimodal_batch_size == 4
         assert loaded.discovery.multimodal_image_max_px == 512
@@ -3158,6 +3186,7 @@ eval_prefilter_mode = "  Shadow  "
         )
         assert 'inspiration_breadth = "high"' in rendered
         assert 'eval_prefilter_mode = "shadow"' in rendered
+        assert 'tag_channel_mode = "off"' in rendered
         assert "multimodal_evaluation_enabled = false" in rendered
         assert "multimodal_batch_size = 8" in rendered
         assert "multimodal_image_max_px = 384" in rendered

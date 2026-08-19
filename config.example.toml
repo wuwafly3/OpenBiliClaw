@@ -597,6 +597,10 @@ candidate_eval_concurrency = 3
 # enforce = 低相似候选不进 LLM。默认 shadow；先 grep prefilter-shadow，
 # 确认 would-be-filtered 且 LLM 分数 >= admission_min_score 的候选约为 0 后再切 enforce。
 eval_prefilter_mode = "shadow"
+# Wave 1 廉价 tags 通道：off = 不额外调用 LLM（默认，避免线上双倍花费）；
+# shadow = 后台抽样打标，不改变 admission；enforce = pending_eval 先打标再跑完整评估。
+# 非法值在保存时拒绝。在 Task 7 探针数字出来之前不要把线上 daemon 设为 enforce。
+tag_channel_mode = "off"
 # 可选封面图评估。默认关闭；开启后 discovery evaluator 会在模型支持图像输入时
 # 把已压缩的候选封面一并送入评估器，模型不支持时自动退回纯文本评估。
 multimodal_evaluation_enabled = false

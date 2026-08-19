@@ -254,6 +254,7 @@ def build_openclaw_adapter_services() -> OpenClawAdapterServices:
         embedding_service=embedding_service,
         concurrency=concurrency,
         eval_prefilter_mode=str(getattr(discovery_cfg, "eval_prefilter_mode", "shadow")),
+        tag_channel_mode=str(getattr(discovery_cfg, "tag_channel_mode", "off")),
     )
     search_strategy = SearchStrategy(
         llm_service=llm_service,

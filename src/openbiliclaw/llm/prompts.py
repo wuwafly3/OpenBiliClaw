@@ -2019,6 +2019,96 @@ def build_batch_content_evaluation_prompt(
     ]
 
 
+# Cheap tags-only channel (Wave 1 / S1.2a). System stays byte-static so
+# provider prompt cache can hit; candidate bytes live only in the user
+# message. No profile, score, franchise, or temporal-v2 evidence.
+# 200-char body cap is a cost bound, not a quality gate — reopen if
+# teacher-agreement probes show truncation hurting style/temporal match
+# (CLAUDE.md pitfall #3).
+_TAG_CHANNEL_BODY_MAX_CHARS = 200
+_BATCH_TAG_SYSTEM_PROMPT = (
+    "<task>\n"
+    "给 user 消息 <content_batch> 里的每条候选打三个标签："
+    "topic_group、style_key、temporal_class。\n"
+    "</task>\n\n"
+    "<rules>\n"
+    '1. 只输出 JSON 对象，顶层键为 "results"；'
+    "数组长度与输入一致、顺序对应；每项原样带回 bvid 或 content_id。\n"
+    "2. topic_group：2-4 词粗分类；同义主题用同一词"
+    "（AI/人工智能/机器学习 → 人工智能）。\n"
+    "3. style_key：观看状态，13 选 1，不是题材：\n"
+    f"{STYLE_KEY_PROMPT_TEXT}\n"
+    "4. temporal_class：核心价值为何会过期，六选一：\n"
+    "   - breaking: 几小时到一两天内会过期的突发\n"
+    "   - current: 正在发生、几天到数周内过期\n"
+    "   - versioned: 版本/赛季/更新会替代的内容\n"
+    "   - evergreen: 长期有效\n"
+    "   - historical: 价值在于已经发生的事实本身\n"
+    "   - unknown: 无法判断\n"
+    "</rules>\n"
+)
+
+
+def _tag_channel_item_view(item: dict[str, object]) -> dict[str, object]:
+    body = str(item.get("body_text") or "").strip()
+    if not body:
+        body = str(item.get("description") or "").strip()
+    if len(body) > _TAG_CHANNEL_BODY_MAX_CHARS:
+        body = body[:_TAG_CHANNEL_BODY_MAX_CHARS]
+    duration_raw = item.get("duration")
+    duration: int | float | str = 0
+    if isinstance(duration_raw, bool):
+        duration = 0
+    elif isinstance(duration_raw, int | float):
+        duration = duration_raw
+    elif isinstance(duration_raw, str) and duration_raw.strip():
+        duration = duration_raw.strip()
+    view: dict[str, object] = {
+        "body_text": body,
+        "content_type": str(item.get("content_type") or "").strip(),
+        "description": str(item.get("description") or "").strip(),
+        "duration": duration,
+        "published_at": str(item.get("published_at") or "").strip(),
+        "source_platform": str(item.get("source_platform") or "").strip(),
+        "title": str(item.get("title") or "").strip(),
+    }
+    bvid = str(item.get("bvid") or "").strip()
+    content_id = str(item.get("content_id") or "").strip()
+    if bvid:
+        view["bvid"] = bvid
+    if content_id:
+        view["content_id"] = content_id
+    return view
+
+
+def build_batch_tag_prompt(
+    *,
+    content_items: list[dict[str, object]],
+) -> list[dict[str, str]]:
+    """Build a profile-free tags-only prompt for one candidate batch.
+
+    ``system_prompt`` is the module-level constant ``_BATCH_TAG_SYSTEM_PROMPT``.
+    See the user message for this batch's ``<content_batch>``.
+    """
+
+    user_prompt = "\n\n".join(
+        [
+            "<content_batch>",
+            json.dumps(
+                [_tag_channel_item_view(item) for item in content_items],
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ),
+            "</content_batch>",
+        ]
+    )
+    return [
+        {"role": "system", "content": _BATCH_TAG_SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
 # 100% static system prompt for single-item recommendation expression.
 # Platform / tone / persona variables live in user_prompt prefix.
 _RECOMMENDATION_EXPRESSION_SYSTEM_PROMPT = """

@@ -25,6 +25,7 @@ from openbiliclaw.discovery.candidate_pool import (
     discovery_candidate_pending_cap,
     row_to_discovered_content,
 )
+from openbiliclaw.discovery.tag_channel import TAG_CHANNEL_SOURCE_LLM
 from openbiliclaw.discovery.temporal import evaluate_temporal_eligibility
 from openbiliclaw.llm.base import classify_llm_unavailability
 from openbiliclaw.sources.platforms import source_family as _source_family
@@ -565,6 +566,7 @@ class DiscoveryCandidatePipeline:
         """Run only the LLM evaluation stage; this method performs no writes."""
 
         started = self.time_fn()
+        await self._maybe_tag_claim(claim)
         scores = await self.discovery_engine.evaluate_content_batch(
             list(claim.items),
             profile,
@@ -580,6 +582,72 @@ class DiscoveryCandidatePipeline:
             scores=tuple(float(score) for score in scores),
             elapsed_seconds=max(0.0, self.time_fn() - started),
         )
+
+    async def _maybe_tag_claim(self, claim: CandidateEvalClaim) -> None:
+        """Cheap-tag untagged claim items when ``tag_channel_mode`` is enforce.
+
+        Fail-open: tag or persist errors log WARNING and still continue to
+        full evaluation. ``off`` / ``shadow`` make zero extra LLM calls here.
+        """
+
+        mode = str(getattr(self.discovery_engine, "tag_channel_mode", "off") or "off")
+        if mode.strip().lower() != "enforce":
+            return
+        untagged = [
+            item
+            for item in claim.items
+            if str(getattr(item, "tag_channel_source", "") or "").strip().lower()
+            != TAG_CHANNEL_SOURCE_LLM
+        ]
+        if not untagged:
+            return
+        tag_fn = getattr(self.discovery_engine, "tag_content_batch", None)
+        if not callable(tag_fn):
+            return
+        try:
+            await tag_fn(untagged, batch_size=max(1, len(untagged)))
+        except Exception:
+            logger.warning(
+                "tag-channel failed for %d candidate(s); continuing with full eval",
+                len(untagged),
+                exc_info=True,
+            )
+            return
+        persist = getattr(self.database, "update_discovery_candidate_tag_channel", None)
+        if not callable(persist):
+            return
+        untagged_ids = {id(item) for item in untagged}
+        persist_rows: list[dict[str, Any]] = []
+        for row, item in zip(claim.rows, claim.items, strict=True):
+            if id(item) not in untagged_ids:
+                continue
+            source = str(getattr(item, "tag_channel_source", "") or "").strip().lower()
+            if source != TAG_CHANNEL_SOURCE_LLM:
+                continue
+            persist_rows.append(
+                {
+                    "candidate_id": int(row.get("id") or 0),
+                    "tag_channel_topic_group": str(
+                        getattr(item, "tag_channel_topic_group", "") or ""
+                    ),
+                    "tag_channel_style_key": str(getattr(item, "tag_channel_style_key", "") or ""),
+                    "tag_channel_temporal_class": str(
+                        getattr(item, "tag_channel_temporal_class", "unknown") or "unknown"
+                    ),
+                    "tag_channel_source": TAG_CHANNEL_SOURCE_LLM,
+                    "tag_channel_model": str(getattr(item, "tag_channel_model", "") or ""),
+                }
+            )
+        if not persist_rows:
+            return
+        try:
+            persist(persist_rows)
+        except Exception:
+            logger.warning(
+                "tag-channel persist failed for %d row(s); continuing with full eval",
+                len(persist_rows),
+                exc_info=True,
+            )
 
     async def complete_claim(
         self,

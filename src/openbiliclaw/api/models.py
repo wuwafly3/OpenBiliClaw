@@ -2317,6 +2317,7 @@ class DiscoveryConfigOut(BaseModel):
     keyword_digest_grace_hours: int = Field(default=24, ge=0, le=168)
     admission_min_score: float = 0.60
     eval_prefilter_mode: Literal["off", "shadow", "enforce"] = "shadow"
+    tag_channel_mode: Literal["off", "shadow", "enforce"] = "off"
     candidate_eval_concurrency: int = Field(default=3, ge=1, le=3)
     multimodal_evaluation_enabled: bool = False
     visual_profile_enabled: bool = False

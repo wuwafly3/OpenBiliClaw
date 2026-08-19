@@ -239,6 +239,7 @@ def test_discovery_config_response_defaults_to_hybrid_with_visual_features_off()
     config = DiscoveryConfigOut()
 
     assert config.keyword_generation_mode == "hybrid"
+    assert config.tag_channel_mode == "off"
     assert config.multimodal_evaluation_enabled is False
     assert config.visual_profile_enabled is False
     assert config.keyframe_enabled is False

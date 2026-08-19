@@ -127,12 +127,13 @@
 
 **Steps:**
 
-- [ ] Script selects teacher-allowlist rows, calls the channel with `--limit`, prints tokens/item and agreement.
-- [ ] Run against `E:/otherproject/OpenBiliClaw/data/openbiliclaw.db` only when the user asks (live LLM spend).
+- [x] Script selects teacher-allowlist rows, calls the channel with `--limit`, prints tokens/item and agreement.
+- [x] Run against `E:/otherproject/OpenBiliClaw/data/openbiliclaw.db` only when the user asks (live LLM spend).
 
 **Acceptance:**
 
 - Numeric gate for S1.8 rewrite later: record tokens/candidate vs `discovery.evaluate_batch`. No pass/fail on agreement for this PR.
+- 2026-08-19 live: 90 teacher-allowlist rows persisted `tag_channel_*` only. Instance `openai-2` / `deepseek-v4-flash-thinking`, batch 15, max_tokens 4096. **323 tokens/candidate** vs last-7d `discovery.evaluate_batch` **344 est** (**0.94x**). Style exact 74.4% (67/90), temporal 62.2% (56/90), topic exact 30.0% (27/90, open vocab). Prompt-cache hit 0%. Default chain `openai-3`→`openai-4` was quota/region blocked during the run; `tag_channel_mode` stayed `off`.
 
 ## Verification after merge
 

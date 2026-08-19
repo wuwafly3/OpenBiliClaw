@@ -16914,6 +16914,7 @@ def create_app(
                 keyword_digest_grace_hours=cfg.discovery.keyword_digest_grace_hours,
                 admission_min_score=cfg.discovery.admission_min_score,
                 eval_prefilter_mode=cfg.discovery.eval_prefilter_mode,
+                tag_channel_mode=cfg.discovery.tag_channel_mode,
                 candidate_eval_concurrency=cfg.discovery.candidate_eval_concurrency,
                 multimodal_evaluation_enabled=cfg.discovery.multimodal_evaluation_enabled,
                 visual_profile_enabled=cfg.discovery.visual_profile_enabled,
@@ -19334,6 +19335,14 @@ def create_app(
                             detail="discovery.eval_prefilter_mode must be off, shadow, or enforce",
                         )
                     cfg.discovery.eval_prefilter_mode = eval_prefilter_mode
+                if "tag_channel_mode" in ddata:
+                    tag_channel_mode = str(ddata["tag_channel_mode"] or "").strip().lower()
+                    if tag_channel_mode not in {"off", "shadow", "enforce"}:
+                        raise HTTPException(
+                            status_code=422,
+                            detail="discovery.tag_channel_mode must be off, shadow, or enforce",
+                        )
+                    cfg.discovery.tag_channel_mode = tag_channel_mode
                 for key, (default, min_value, max_value) in discovery_int_limits.items():
                     if key in ddata:
                         setattr(

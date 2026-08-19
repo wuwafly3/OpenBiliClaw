@@ -47,6 +47,7 @@ from openbiliclaw.discovery.prefilter_audit import (
     validate_prefilter_storage_record,
 )
 from openbiliclaw.discovery.score_source import LLM_JUDGMENT_SCORE_SOURCES
+from openbiliclaw.discovery.style_keys import normalize_style_key
 from openbiliclaw.discovery.temporal import (
     PUBLICATION_CLOCK_SKEW_TOLERANCE,
     TEMPORAL_CONFIDENCE_FULL,
@@ -1158,6 +1159,15 @@ CREATE TABLE IF NOT EXISTS discovery_candidates (
     -- actual response object — a fixed-teacher collection window stays
     -- auditable even when provider fallback reroutes a call.
     teacher_model         TEXT NOT NULL DEFAULT '',
+    -- Cheap tags-only channel (Wave 1 / S1.2a). Isolated from teacher
+    -- topic_group / style_key / temporal_* so a later ML feature write
+    -- cannot poison distillation labels.
+    tag_channel_topic_group TEXT NOT NULL DEFAULT '',
+    tag_channel_style_key TEXT NOT NULL DEFAULT '',
+    tag_channel_temporal_class TEXT NOT NULL DEFAULT 'unknown',
+    tag_channel_source    TEXT NOT NULL DEFAULT '',
+    tag_channel_model     TEXT NOT NULL DEFAULT '',
+    tag_channel_at        TEXT NOT NULL DEFAULT '',
     temporal_class        TEXT NOT NULL DEFAULT 'unknown',
     temporal_confidence   REAL NOT NULL DEFAULT 0.0,
     temporal_reason       TEXT NOT NULL DEFAULT '',
@@ -6230,6 +6240,62 @@ class Database:
                 claim_token=None,
             ):
                 updated += 1
+        return updated
+
+    def update_discovery_candidate_tag_channel(
+        self,
+        rows: Sequence[Mapping[str, Any]],
+    ) -> int:
+        """Persist cheap tags-only labels without touching teacher columns.
+
+        Updates ``tag_channel_*`` only. Teacher ``topic_group`` / ``style_key``
+        / ``temporal_*`` / ``score_source`` / ``llm_score_raw`` stay as they
+        are. Unknown style tokens coerce to empty; unknown temporal classes
+        coerce to ``unknown``.
+        """
+
+        updated = 0
+        stamped_at = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        for row in rows:
+            candidate_id = int(row.get("candidate_id") or row.get("id") or 0)
+            if candidate_id <= 0:
+                continue
+            topic_group = str(row.get("tag_channel_topic_group") or row.get("topic_group") or "")
+            topic_group = " ".join(topic_group.split())
+            style_key = normalize_style_key(
+                row.get("tag_channel_style_key", row.get("style_key", ""))
+            )
+            temporal_class = normalize_temporal_class(
+                row.get("tag_channel_temporal_class", row.get("temporal_class", ""))
+            )
+            source = str(row.get("tag_channel_source") or "llm").strip() or "llm"
+            model = str(row.get("tag_channel_model") or "").strip()
+            tagged_at = str(row.get("tag_channel_at") or "").strip() or stamped_at
+            cursor = self.conn.execute(
+                """
+                UPDATE discovery_candidates
+                SET tag_channel_topic_group = ?,
+                    tag_channel_style_key = ?,
+                    tag_channel_temporal_class = ?,
+                    tag_channel_source = ?,
+                    tag_channel_model = ?,
+                    tag_channel_at = ?
+                WHERE id = ?
+                """,
+                (
+                    topic_group,
+                    style_key,
+                    temporal_class,
+                    source,
+                    model,
+                    tagged_at,
+                    candidate_id,
+                ),
+            )
+            if cursor.rowcount:
+                updated += 1
+        if updated:
+            self.conn.commit()
         return updated
 
     def _persist_discovery_candidate_evaluation(
@@ -13649,6 +13715,12 @@ class Database:
             "score_source": "TEXT NOT NULL DEFAULT ''",
             "llm_score_raw": "REAL",
             "teacher_model": "TEXT NOT NULL DEFAULT ''",
+            "tag_channel_topic_group": "TEXT NOT NULL DEFAULT ''",
+            "tag_channel_style_key": "TEXT NOT NULL DEFAULT ''",
+            "tag_channel_temporal_class": "TEXT NOT NULL DEFAULT 'unknown'",
+            "tag_channel_source": "TEXT NOT NULL DEFAULT ''",
+            "tag_channel_model": "TEXT NOT NULL DEFAULT ''",
+            "tag_channel_at": "TEXT NOT NULL DEFAULT ''",
         }
         for column_name, column_type in required_columns.items():
             if column_name in existing_columns:
