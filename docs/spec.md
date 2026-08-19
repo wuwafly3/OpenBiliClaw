@@ -489,11 +489,11 @@ trusted LAN ─ HTTPS（可选）──→ TLS Proxy :8443 ─ loopback/Compose 
 │  │           Agent Orchestrator (自研)                   │   │
 │  │   (任务调度 / 策略决策 / 多步推理 / 自省 / Skill 调度)    │   │
 │  └──────────────────────────────────────────────────────┘   │
-│  ┌──────────────┐ ┌──────────────┐ ┌────────────────┐      │
-│  │ User Soul    │ │ Content      │ │ Recommendation │      │
-│  │ Engine       │ │ Discovery    │ │ Engine         │      │
-│  │ (词表画像+探针)│ │ (发现+待评估池)│ │ (排序+表达)     │      │
-│  └──────────────┘ └──────────────┘ └────────────────┘      │
+│  ┌──────────────┐ ┌──────────────┐ ┌────────────────┐ ┌─────────┐ │
+│  │ User Soul    │ │ Content      │ │ Recommendation │ │ ML      │ │
+│  │ Engine       │ │ Discovery    │ │ Engine         │ │ 准入推理│ │
+│  │ (词表画像+探针)│ │ (发现+待评估池)│ │ (排序+表达)     │ │ numpy   │ │
+│  └──────────────┘ └──────────────┘ └────────────────┘ └─────────┘ │
 │  ┌──────────────────────────────────────────────────────┐   │
 │  │     PoolCurator + 双轴 fatigue + per-group 窗口 + 新兴趣放大保护 │ │
 │  │     request_replenishment + 定时/手动补货 + B/XHS/DY/YT/X/Zhihu/Reddit/Linux.do/Bangumi=5/1/1/1/1/1/1/1/1 │ │
@@ -633,6 +633,7 @@ trusted LAN ─ HTTPS（可选）──→ TLS Proxy :8443 ─ loopback/Compose 
 │  └───────────┘ └─────────────┘ └────────────┘ └─────────┘  │
 │  SQLite: events(inferred_satisfaction) / seen_items(views+saves+snapshot)   │
 │          discovery_candidates → relevance + temporal eligible/review_due/expired admission │
+│          evaluation_context_snapshots (compact eval profile + negatives, keyed by digest) │
 │          evaluator_prefilter_shadow_audit (30d / 20k bounded, no raw content) │
 │          discovery_keywords → 24h safe cross-digest pending reconcile (0=hard expiry) │
 │          admitted pending copy → bounded copy-ready watermark → serve/refill │

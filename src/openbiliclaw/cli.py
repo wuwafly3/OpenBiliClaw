@@ -1092,6 +1092,7 @@ def _build_discovery_engine() -> Any:
     )
     from openbiliclaw.llm.concurrency import background_llm_concurrency
     from openbiliclaw.llm.service import LLMService, module_overrides_from_config
+    from openbiliclaw.ml.inference import resolve_model_path
 
     memory = _build_memory_manager()
     database = _get_runtime_database()
@@ -1144,6 +1145,11 @@ def _build_discovery_engine() -> Any:
         ),
         eval_prefilter_mode=str(getattr(discovery_cfg, "eval_prefilter_mode", "shadow")),
         tag_channel_mode=str(getattr(discovery_cfg, "tag_channel_mode", "off")),
+        relevance_scorer=str(getattr(discovery_cfg, "relevance_scorer", "llm")),
+        relevance_model_path=resolve_model_path(
+            getattr(discovery_cfg, "relevance_model_path", ""),
+            cfg.data_path,
+        ),
     )
     search_strategy = SearchStrategy(
         llm_service=llm_service,

@@ -20,6 +20,11 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar, cast
 
 from openbiliclaw.discovery.admission import effective_admission_threshold
+from openbiliclaw.discovery.eval_context import (
+    EvaluationContextSnapshot,
+    compute_negative_digest,
+    compute_profile_digest,
+)
 from openbiliclaw.discovery.eval_payload import (
     CanonicalEvaluationBatch,
     build_canonical_evaluation_batch,
@@ -39,6 +44,7 @@ from openbiliclaw.discovery.prefilter_audit import (
     sanitize_prefilter_platform,
 )
 from openbiliclaw.discovery.score_source import (
+    LLM_JUDGMENT_SCORE_SOURCES,
     SCORE_SOURCE_CAP_FRANCHISE,
     SCORE_SOURCE_CAP_STYLE,
     SCORE_SOURCE_EVAL_ERROR,
@@ -215,6 +221,7 @@ _TAG_CHANNEL_CACHE_VERSION = "tag-channel-v1"
 _TAG_CHANNEL_CACHE_MAX_ENTRIES: int = 4096
 _TAG_CHANNEL_CALLER = "discovery.tag_batch"
 _TAG_CHANNEL_MODES = frozenset({"off", "shadow", "enforce"})
+_RELEVANCE_SCORER_MODES = frozenset({"llm", "shadow", "ml"})
 _TagChannelCacheEntry = tuple[str, str, str, str]
 _LLM_EVAL_OVERSAMPLE_FACTOR: int = 2
 
@@ -939,6 +946,11 @@ class DiscoveredContent:
     # window stay auditable; mixing teachers is a real variance source
     # (measured batch drift std 0.114 ≈ within-batch 0.137).
     teacher_model: str = ""
+    # Compact eval-visible profile / negative-exemplar digests captured at
+    # labeling time. Empty on non-teacher paths and on rows evaluated before
+    # this stamp shipped. Payload is in ``evaluation_context_snapshots``.
+    profile_digest: str = ""
+    negative_digest: str = ""
     # Cheap tags-only channel (Wave 1). Isolated from teacher topic/style/
     # temporal so ML features can exist before full ``evaluate_batch``.
     tag_channel_topic_group: str = ""
@@ -946,6 +958,11 @@ class DiscoveredContent:
     tag_channel_temporal_class: str = "unknown"
     tag_channel_source: str = ""
     tag_channel_model: str = ""
+    # Wave 1 numpy admission scorer (in-memory only; not persisted).
+    ml_admission_proba: float | None = None
+    ml_admission_admitted: bool | None = None
+    ml_admission_status: str = ""
+    ml_admission_reason: str = ""
     temporal_class: str = "unknown"  # Why this content's value may expire
     temporal_confidence: float = 0.0  # Evaluator confidence in temporal_class
     temporal_reason: str = ""  # Short diagnostic for the temporal classification
@@ -1282,6 +1299,8 @@ class ContentDiscoveryEngine:
         eval_batch_concurrency: int = _DEFAULT_EVAL_BATCH_CONCURRENCY,
         eval_prefilter_mode: str = _EMBEDDING_PREFILTER_DEFAULT_MODE,
         tag_channel_mode: str = "off",
+        relevance_scorer: str = "llm",
+        relevance_model_path: str = "",
         compact_evaluation_json: bool = False,
         evaluation_candidate_transport: str = _DEFAULT_EVALUATION_CANDIDATE_TRANSPORT,
     ) -> None:
@@ -1303,6 +1322,11 @@ class ContentDiscoveryEngine:
         self.eval_batch_concurrency = max(1, min(16, int(eval_batch_concurrency)))
         self.eval_prefilter_mode = self._normalize_eval_prefilter_mode(eval_prefilter_mode)
         self.tag_channel_mode = self._normalize_tag_channel_mode(tag_channel_mode)
+        self.relevance_scorer = self._normalize_relevance_scorer(relevance_scorer)
+        self.relevance_model_path = str(relevance_model_path or "").strip()
+        self._admission_model: Any = None
+        self._admission_model_error = ""
+        self._ml_skip_eval_warned = False
         # Replay-only unless and until the real provider quality/token gate
         # approves compact deterministic evaluator JSON.
         self.compact_evaluation_json = bool(compact_evaluation_json)
@@ -1328,6 +1352,7 @@ class ContentDiscoveryEngine:
         self._negative_exemplars_cache: tuple[float, int | None, list[dict[str, object]]] | None = (
             None
         )
+        self._evaluation_context_override: EvaluationContextSnapshot | None = None
 
     def _eval_cache_store(self) -> OrderedDict[str, _EvalCacheEntry]:
         # Tests (and older call sites) reset the cache by assigning a plain
@@ -1366,6 +1391,145 @@ class ContentDiscoveryEngine:
         if normalized in _TAG_CHANNEL_MODES:
             return normalized
         return "off"
+
+    @staticmethod
+    def _normalize_relevance_scorer(mode: str) -> str:
+        normalized = str(mode or "").strip().lower()
+        if normalized in _RELEVANCE_SCORER_MODES:
+            return normalized
+        return "llm"
+
+    def _get_admission_model(self) -> Any:
+        if self._admission_model is not None:
+            return self._admission_model
+        if self._admission_model_error:
+            return None
+        from openbiliclaw.ml.inference import AdmissionModel, AdmissionModelError
+
+        path = self.relevance_model_path
+        if not path:
+            self._admission_model_error = "model_path_empty"
+            return None
+        try:
+            self._admission_model = AdmissionModel.load(path)
+        except AdmissionModelError as exc:
+            self._admission_model_error = str(exc)
+            logger.warning("admission model unavailable; failing open: %s", exc)
+            return None
+        except Exception as exc:
+            self._admission_model_error = f"load_failed:{exc}"
+            logger.warning("admission model load failed open: %s", exc)
+            return None
+        return self._admission_model
+
+    def score_admission_batch(
+        self,
+        contents: Sequence[DiscoveredContent],
+        *,
+        prefilter_by_id: Mapping[int, Any] | None = None,
+    ) -> None:
+        """Score cheap-tagged candidates. Never writes a relevance_score.
+
+        ``llm`` is a no-op. ``shadow`` / ``ml`` attach in-memory predictions
+        and fail open when the artifact or cheap tags are missing. ``ml`` does
+        not skip ``evaluate_batch`` in this slice (S1.5 not yet met).
+        """
+
+        mode = self.relevance_scorer
+        if mode not in {"shadow", "ml"} or not contents:
+            return
+        if mode == "ml" and not self._ml_skip_eval_warned:
+            logger.warning("relevance_scorer=ml is observational; evaluate_batch is not skipped")
+            self._ml_skip_eval_warned = True
+        try:
+            self._score_admission_batch_inner(contents, prefilter_by_id=prefilter_by_id)
+        except Exception as exc:
+            logger.warning("admission scoring failed open: %s", exc)
+            for content in contents:
+                if content.ml_admission_status == "scored":
+                    continue
+                content.ml_admission_status = "fail_open"
+                content.ml_admission_reason = f"unexpected:{exc}"
+
+    def _score_admission_batch_inner(
+        self,
+        contents: Sequence[DiscoveredContent],
+        *,
+        prefilter_by_id: Mapping[int, Any] | None,
+    ) -> None:
+        from openbiliclaw.ml.features import TAG_SOURCE_CHEAP, feature_record_from_content
+
+        model = self._get_admission_model()
+        if model is None:
+            reason = self._admission_model_error or "model_unavailable"
+            for content in contents:
+                content.ml_admission_status = "fail_open"
+                content.ml_admission_reason = reason
+            return
+        records: list[dict[str, Any]] = []
+        index_map: list[int] = []
+        for index, content in enumerate(contents):
+            source = str(content.tag_channel_source or "").strip().lower()
+            if source != TAG_CHANNEL_SOURCE_LLM:
+                content.ml_admission_status = "fail_open"
+                content.ml_admission_reason = "missing_cheap_tags"
+                continue
+            record = feature_record_from_content(content, tag_source=TAG_SOURCE_CHEAP)
+            decision = (prefilter_by_id or {}).get(id(content))
+            if decision is not None and getattr(decision, "similarity", None) is not None:
+                record["sim"] = float(decision.similarity)
+                record["would_filter"] = 1.0 if bool(decision.would_filter) else 0.0
+                record["context"] = str(getattr(decision, "context_class", "") or "other")
+            records.append(record)
+            index_map.append(index)
+        if not records:
+            logger.warning(
+                "admission fail-open: no cheap-tagged candidates in batch of %d",
+                len(contents),
+            )
+            return
+        result = model.predict(records)
+        if not result.ok or len(result.predictions) != len(index_map):
+            reason = result.reason or "predict_failed"
+            if result.ok:
+                reason = "prediction_count_mismatch"
+            logger.warning("admission inference failed open: %s", reason)
+            for index in index_map:
+                contents[index].ml_admission_status = "fail_open"
+                contents[index].ml_admission_reason = reason
+            return
+        for index, prediction in zip(index_map, result.predictions, strict=True):
+            content = contents[index]
+            if prediction is None:
+                content.ml_admission_status = "fail_open"
+                content.ml_admission_reason = "empty_prediction"
+                continue
+            content.ml_admission_proba = prediction.probability
+            content.ml_admission_admitted = prediction.admitted
+            content.ml_admission_status = "scored"
+            content.ml_admission_reason = ""
+
+    def _log_admission_shadow(self, contents: Sequence[DiscoveredContent]) -> None:
+        if self.relevance_scorer not in {"shadow", "ml"}:
+            return
+        for content in contents:
+            if content.ml_admission_status != "scored" or content.ml_admission_admitted is None:
+                continue
+            if content.score_source != SCORE_SOURCE_LLM:
+                continue
+            llm_admitted = float(
+                content.relevance_score or 0.0
+            ) >= self._admission_threshold_for_item(content)
+            if bool(content.ml_admission_admitted) == bool(llm_admitted):
+                continue
+            logger.info(
+                "ml-shadow disagreement platform=%s strategy=%s ml=%s llm=%s p=%.3f",
+                content.source_platform or "unknown",
+                content.source_strategy or "unknown",
+                int(content.ml_admission_admitted),
+                int(llm_admitted),
+                float(content.ml_admission_proba or 0.0),
+            )
 
     @staticmethod
     def _embedding_prefilter_content_text(content: DiscoveredContent) -> str:
@@ -2244,6 +2408,25 @@ class ContentDiscoveryEngine:
         if self._llm_service is None:
             return 0.0
 
+        snapshot, owns_context = self._bind_evaluation_context(profile)
+        try:
+            return await self._evaluate_content_with_context(
+                content,
+                profile,
+                snapshot,
+                source_context=source_context,
+            )
+        finally:
+            self._unbind_evaluation_context(owns_context)
+
+    async def _evaluate_content_with_context(
+        self,
+        content: DiscoveredContent,
+        profile: SoulProfile,
+        snapshot: EvaluationContextSnapshot,
+        *,
+        source_context: str = "",
+    ) -> float:
         from openbiliclaw.llm.prompts import content_evaluation_clock
 
         evaluated_at, evaluation_bucket = content_evaluation_clock()
@@ -2251,7 +2434,7 @@ class ContentDiscoveryEngine:
         # reloads with equivalent values should hit; content/context/model changes
         # must miss without issuing an embedding or LLM request. Publication
         # metadata and the hourly evaluation clock are prompt-visible too.
-        profile_digest = self._evaluation_profile_digest(profile)
+        profile_digest = snapshot.profile_digest
         cache_key = self._single_eval_cache_key(
             content,
             profile_digest=profile_digest,
@@ -2286,6 +2469,7 @@ class ContentDiscoveryEngine:
                     evaluated_at=evaluated_at,
                     evidence_text=_temporal_evidence_text(content),
                 )
+                self._stamp_evaluation_context([content], snapshot)
                 return score
 
         prefilter_mode = self._normalize_eval_prefilter_mode(
@@ -2340,6 +2524,11 @@ class ContentDiscoveryEngine:
                         _eval_cache_entry_for_content(content),
                     )
                     return content.relevance_score
+
+        prefilter_by_id: dict[int, PrefilterShadowDecision] = {}
+        if shadow_decisions:
+            prefilter_by_id[id(content)] = shadow_decisions[0]
+        self.score_admission_batch([content], prefilter_by_id=prefilter_by_id)
 
         from openbiliclaw.llm.prompts import build_content_evaluation_prompt
 
@@ -2401,6 +2590,7 @@ class ContentDiscoveryEngine:
             content.score_source = SCORE_SOURCE_EVAL_ERROR
             content.llm_score_raw = None
             content.teacher_model = ""
+            self._log_admission_shadow([content])
             return 0.0
 
         content.relevance_score = score
@@ -2428,6 +2618,8 @@ class ContentDiscoveryEngine:
             {0: score},
             persisted=shadow_persisted,
         )
+        self._log_admission_shadow([content])
+        self._stamp_evaluation_context([content], snapshot)
         return score
 
     # Safety cap applied at the evaluator level regardless of caller.
@@ -2609,6 +2801,27 @@ class ContentDiscoveryEngine:
         if self._llm_service is None or not contents:
             return [0.0] * len(contents)
 
+        snapshot, owns_context = self._bind_evaluation_context(profile)
+        try:
+            return await self._evaluate_content_batch_with_context(
+                contents,
+                profile,
+                snapshot,
+                source_context=source_context,
+                batch_size=batch_size,
+            )
+        finally:
+            self._unbind_evaluation_context(owns_context)
+
+    async def _evaluate_content_batch_with_context(
+        self,
+        contents: list[DiscoveredContent],
+        profile: SoulProfile,
+        snapshot: EvaluationContextSnapshot,
+        *,
+        source_context: str = "",
+        batch_size: int = _DEFAULT_EVAL_BATCH_SIZE,
+    ) -> list[float]:
         from openbiliclaw.llm.prompts import content_evaluation_clock
 
         evaluated_at, evaluation_bucket = content_evaluation_clock()
@@ -2661,6 +2874,7 @@ class ContentDiscoveryEngine:
         )
 
         def finalize_scores(*, effective_batch_size: int, apply_cached_caps: bool) -> list[float]:
+            self._log_admission_shadow(eval_contents)
             if apply_cached_caps:
                 group_size = max(1, int(effective_batch_size))
                 for start in range(0, len(eval_contents), group_size):
@@ -2678,6 +2892,9 @@ class ContentDiscoveryEngine:
                     len(eval_contents),
                     sum(scores[index] > 0 for index in eval_indices),
                 )
+            # Stamp after intra-batch caps so cap_* rows still carry the
+            # labeling-time digest (they remain teacher-allowlist sources).
+            self._stamp_evaluation_context(contents, snapshot)
             if len(scores) < original_len:
                 return scores + [0.0] * (original_len - len(scores))
             return scores
@@ -2873,8 +3090,16 @@ class ContentDiscoveryEngine:
                         apply_cached_caps=cache_hit_count > 0,
                     )
 
+        remaining = [eval_contents[i] for i in uncached_indices]
+        prefilter_by_id: dict[int, PrefilterShadowDecision] = {}
+        if shadow_contents:
+            for decision in shadow_decisions:
+                if 0 <= decision.content_index < len(shadow_contents):
+                    prefilter_by_id[id(shadow_contents[decision.content_index])] = decision
+        self.score_admission_batch(remaining, prefilter_by_id=prefilter_by_id)
+
         batch_size = self._effective_eval_batch_size(
-            [eval_contents[i] for i in uncached_indices],
+            remaining,
             batch_size,
         )
         if self.multimodal_unavailable_reason:
@@ -3091,8 +3316,8 @@ class ContentDiscoveryEngine:
             return None
         return int(latest_id)
 
-    def _get_negative_exemplars(self) -> list[dict[str, object]] | None:
-        """Return recent negative exemplars, refreshing the cache when stale.
+    def _load_live_negative_exemplars(self) -> list[dict[str, object]] | None:
+        """Load recent negative exemplars from storage, refreshing a short cache.
 
         Cache key: (latest_event_id, time bucket). 5-minute TTL keeps the
         I/O flat across batches; latest-event-id invalidation picks up
@@ -3131,20 +3356,105 @@ class ContentDiscoveryEngine:
         self._negative_exemplars_cache = (time.monotonic(), latest_id, exemplars)
         return exemplars
 
+    def _bound_evaluation_context(self) -> EvaluationContextSnapshot | None:
+        override = getattr(self, "_evaluation_context_override", None)
+        return override if isinstance(override, EvaluationContextSnapshot) else None
+
+    def _get_negative_exemplars(self) -> list[dict[str, object]] | None:
+        """Return the negatives the current eval prompt should see.
+
+        A bound evaluation-context snapshot wins so replay / self-consistency
+        probes freeze the labeling-time list. Live evaluation falls through
+        to storage. Empty snapshots collapse to None so the user message
+        stays byte-identical to the no-examples cold-start shape.
+        """
+        override = self._bound_evaluation_context()
+        if override is not None:
+            examples = list(override.negative_examples)
+            return examples or None
+        return self._load_live_negative_exemplars()
+
     def _evaluation_profile_digest(self, profile: SoulProfile) -> str:
         """Digest the structured profile slice and recall pool visible to evaluation."""
 
+        override = self._bound_evaluation_context()
+        if override is not None:
+            return override.profile_digest
         compacted = self._evaluation_profile_summary(profile)
-        return stable_json_digest(
-            {
-                "summary": compacted,
-                "recall_pool": _evaluation_recall_pool_digest_payload(profile),
-            }
+        return compute_profile_digest(
+            compacted,
+            _evaluation_recall_pool_digest_payload(profile),
         )
 
-    @staticmethod
-    def _evaluation_profile_summary(profile: SoulProfile) -> dict[str, object]:
+    def _evaluation_profile_summary(self, profile: SoulProfile) -> dict[str, object]:
+        override = self._bound_evaluation_context()
+        if override is not None:
+            return dict(override.profile_summary)
         return compact_evaluation_profile_summary(build_profile_summary(profile))
+
+    def _build_live_evaluation_context(self, profile: SoulProfile) -> EvaluationContextSnapshot:
+        summary = compact_evaluation_profile_summary(build_profile_summary(profile))
+        recall_pool = _evaluation_recall_pool_digest_payload(profile)
+        # Bind only calls this while override is unset. Use the public getter
+        # so replay/test subclasses that stub `_get_negative_exemplars` freeze
+        # the same list the prompt will see. Do not call this after bind —
+        # the getter would then echo the snapshot being built.
+        examples = list(self._get_negative_exemplars() or [])
+        return EvaluationContextSnapshot(
+            profile_digest=compute_profile_digest(summary, recall_pool),
+            negative_digest=compute_negative_digest(examples),
+            profile_summary=summary,
+            recall_pool=recall_pool,
+            negative_examples=examples,
+        )
+
+    def _bind_evaluation_context(
+        self, profile: SoulProfile
+    ) -> tuple[EvaluationContextSnapshot, bool]:
+        existing = self._bound_evaluation_context()
+        if existing is not None:
+            return existing, False
+        snapshot = self._build_live_evaluation_context(profile)
+        self._evaluation_context_override = snapshot
+        return snapshot, True
+
+    def _unbind_evaluation_context(self, owns: bool) -> None:
+        if owns:
+            self._evaluation_context_override = None
+
+    def _remember_evaluation_context(self, snapshot: EvaluationContextSnapshot) -> None:
+        database = getattr(self, "_database", None)
+        upsert = getattr(database, "upsert_evaluation_context_snapshot", None)
+        if not callable(upsert):
+            return
+        try:
+            upsert(snapshot)
+        except Exception:
+            logger.warning("failed to persist evaluation context snapshot", exc_info=True)
+
+    def _stamp_evaluation_context(
+        self,
+        contents: Sequence[DiscoveredContent],
+        snapshot: EvaluationContextSnapshot,
+    ) -> None:
+        stamped = False
+        for content in contents:
+            if str(content.score_source or "") not in LLM_JUDGMENT_SCORE_SOURCES:
+                continue
+            content.profile_digest = snapshot.profile_digest
+            content.negative_digest = snapshot.negative_digest
+            stamped = True
+        if stamped:
+            self._remember_evaluation_context(snapshot)
+
+    def _recall_interests_for_evaluation(self, profile: SoulProfile) -> list[dict[str, object]]:
+        override = self._bound_evaluation_context()
+        if override is not None:
+            return [
+                {"name": name, "category": category, "weight": weight}
+                for name, category, weight in override.recall_pool
+            ]
+        return _evaluation_recall_interests(profile)
 
     async def _related_interests_for_content(
         self,
@@ -3174,7 +3484,7 @@ class ContentDiscoveryEngine:
         embedding_service = getattr(self, "_embedding_service", None)
         if embedding_service is None:
             return _RelatedInterestRecall([], True)
-        interests = _evaluation_recall_interests(profile)
+        interests = self._recall_interests_for_evaluation(profile)
         if not interests:
             return _RelatedInterestRecall([], True)
         try:
@@ -3235,7 +3545,7 @@ class ContentDiscoveryEngine:
         embedding_service = getattr(self, "_embedding_service", None)
         if embedding_service is None or not contents:
             return _BatchRelatedInterestRecall({}, all_indices)
-        interests = _evaluation_recall_interests(profile)
+        interests = self._recall_interests_for_evaluation(profile)
         if not interests:
             return _BatchRelatedInterestRecall({}, all_indices)
         try:

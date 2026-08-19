@@ -36,6 +36,14 @@ from openbiliclaw.discovery.admission import (
     EXPLORE_STRATEGY,
     effective_admission_threshold,
 )
+from openbiliclaw.discovery.eval_context import (
+    SNAPSHOT_SCHEMA_VERSION,
+    EvaluationContextSnapshot,
+    dumps_snapshot_json,
+    loads_snapshot_json,
+    parse_negative_examples,
+    parse_recall_pool,
+)
 from openbiliclaw.discovery.inspiration import (
     AxisRow,
     _normalize_match_text,
@@ -1159,6 +1167,11 @@ CREATE TABLE IF NOT EXISTS discovery_candidates (
     -- actual response object — a fixed-teacher collection window stays
     -- auditable even when provider fallback reroutes a call.
     teacher_model         TEXT NOT NULL DEFAULT '',
+    -- Eval-visible profile + negative-exemplar digests at labeling time
+    -- (same hashes as the in-memory eval cache). Empty on legacy rows.
+    -- The compact payload lives in evaluation_context_snapshots.
+    profile_digest        TEXT NOT NULL DEFAULT '',
+    negative_digest       TEXT NOT NULL DEFAULT '',
     -- Cheap tags-only channel (Wave 1 / S1.2a). Isolated from teacher
     -- topic_group / style_key / temporal_* so a later ML feature write
     -- cannot poison distillation labels.
@@ -1357,6 +1370,24 @@ CREATE TABLE IF NOT EXISTS llm_usage (
 );
 CREATE INDEX IF NOT EXISTS idx_llm_usage_timestamp ON llm_usage(timestamp);
 CREATE INDEX IF NOT EXISTS idx_llm_usage_provider ON llm_usage(provider, model);
+
+-- Compact eval-visible profile + negative exemplars frozen at teacher
+-- labeling time. Keyed by the same short digests stamped on
+-- discovery_candidates. Local-only; no portrait; negatives may repeat
+-- disliked titles already stored in the event log.
+CREATE TABLE IF NOT EXISTS evaluation_context_snapshots (
+    profile_digest         TEXT NOT NULL,
+    negative_digest        TEXT NOT NULL,
+    schema_version         INTEGER NOT NULL DEFAULT 1,
+    profile_summary_json   TEXT NOT NULL,
+    recall_pool_json       TEXT NOT NULL DEFAULT '[]',
+    negative_examples_json TEXT NOT NULL DEFAULT '[]',
+    created_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_seen_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (profile_digest, negative_digest)
+);
+CREATE INDEX IF NOT EXISTS idx_evaluation_context_snapshots_seen
+    ON evaluation_context_snapshots(last_seen_at);
 
 -- Phase 2 evaluator prefilter evidence. This table intentionally contains no
 -- title, URL, author, prompt, profile text, or provider response. The shadow
@@ -2104,6 +2135,7 @@ class Database:
         self._ensure_source_recipes_table()
         self._ensure_xhs_observed_urls_table()
         self._ensure_discovery_candidate_columns()
+        self._ensure_evaluation_context_snapshots_table()
         self._normalize_legacy_style_keys()
         self._ensure_llm_usage_cache_columns()
         self._ensure_chat_turns_table()
@@ -6477,6 +6509,8 @@ class Database:
                             score_source = ?,
                             llm_score_raw = ?,
                             teacher_model = ?,
+                            profile_digest = ?,
+                            negative_digest = ?,
                             temporal_class = ?,
                             temporal_confidence = ?,
                             temporal_reason = ?,
@@ -6522,6 +6556,8 @@ class Database:
                                 else None
                             ),
                             str(evaluation.get("teacher_model") or ""),
+                            str(evaluation.get("profile_digest") or ""),
+                            str(evaluation.get("negative_digest") or ""),
                             temporal[0],
                             temporal[1],
                             temporal[2],
@@ -6866,7 +6902,7 @@ class Database:
                    candidate_tier, score_threshold,
                    topic_key, topic_group, style_key, franchise_key,
                    relevance_score, relevance_reason, score_source, llm_score_raw,
-                   teacher_model,
+                   teacher_model, profile_digest, negative_digest,
                    temporal_class, temporal_confidence,
                    temporal_validity_mode, temporal_valid_until,
                    temporal_scope, temporal_state,
@@ -6879,6 +6915,92 @@ class Database:
             tuple(sorted(LLM_JUDGMENT_SCORE_SOURCES)),
         )
         return [dict(row) for row in cursor.fetchall()]
+
+    def upsert_evaluation_context_snapshot(self, snapshot: EvaluationContextSnapshot) -> bool:
+        """Store or refresh the compact eval context for a digest pair.
+
+        Does not write candidate titles except those already present in
+        ``negative_examples``. Returns False when digests do not match the
+        payload (corrupt / partial snapshot).
+        """
+
+        if not snapshot.profile_digest or not snapshot.digests_match():
+            logger.warning(
+                "evaluation context snapshot rejected: digest mismatch or empty profile_digest"
+            )
+            return False
+        self.conn.execute(
+            """
+            INSERT INTO evaluation_context_snapshots (
+                profile_digest, negative_digest, schema_version,
+                profile_summary_json, recall_pool_json, negative_examples_json,
+                created_at, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT(profile_digest, negative_digest) DO UPDATE SET
+                schema_version = excluded.schema_version,
+                profile_summary_json = excluded.profile_summary_json,
+                recall_pool_json = excluded.recall_pool_json,
+                negative_examples_json = excluded.negative_examples_json,
+                last_seen_at = CURRENT_TIMESTAMP
+            """,
+            (
+                snapshot.profile_digest,
+                snapshot.negative_digest,
+                int(snapshot.schema_version or SNAPSHOT_SCHEMA_VERSION),
+                dumps_snapshot_json(snapshot.profile_summary),
+                dumps_snapshot_json(snapshot.recall_pool),
+                dumps_snapshot_json(snapshot.negative_examples),
+            ),
+        )
+        self.conn.commit()
+        return True
+
+    def get_evaluation_context_snapshot(
+        self,
+        *,
+        profile_digest: str,
+        negative_digest: str,
+    ) -> EvaluationContextSnapshot | None:
+        """Return a verified snapshot, or None if missing / hash-mismatched."""
+
+        digest = str(profile_digest or "").strip()
+        negative = str(negative_digest or "").strip()
+        if not digest:
+            return None
+        self._ensure_fresh_read()
+        row = self.conn.execute(
+            """
+            SELECT profile_digest, negative_digest, schema_version,
+                   profile_summary_json, recall_pool_json, negative_examples_json
+            FROM evaluation_context_snapshots
+            WHERE profile_digest = ? AND negative_digest = ?
+            LIMIT 1
+            """,
+            (digest, negative),
+        ).fetchone()
+        if row is None:
+            return None
+        summary_raw = loads_snapshot_json(str(row["profile_summary_json"] or ""))
+        if not isinstance(summary_raw, dict):
+            logger.warning("evaluation context snapshot %s has invalid profile JSON", digest)
+            return None
+        snapshot = EvaluationContextSnapshot(
+            profile_digest=str(row["profile_digest"] or ""),
+            negative_digest=str(row["negative_digest"] or ""),
+            profile_summary=dict(summary_raw),
+            recall_pool=parse_recall_pool(loads_snapshot_json(str(row["recall_pool_json"] or ""))),
+            negative_examples=parse_negative_examples(
+                loads_snapshot_json(str(row["negative_examples_json"] or ""))
+            ),
+            schema_version=int(row["schema_version"] or SNAPSHOT_SCHEMA_VERSION),
+        )
+        if not snapshot.digests_match():
+            logger.warning(
+                "evaluation context snapshot %s failed digest verification",
+                digest,
+            )
+            return None
+        return snapshot
 
     def count_discovery_candidates_by_status(self) -> dict[str, int]:
         """Return lifecycle totals plus the currently claimable pending count."""
@@ -13715,6 +13837,8 @@ class Database:
             "score_source": "TEXT NOT NULL DEFAULT ''",
             "llm_score_raw": "REAL",
             "teacher_model": "TEXT NOT NULL DEFAULT ''",
+            "profile_digest": "TEXT NOT NULL DEFAULT ''",
+            "negative_digest": "TEXT NOT NULL DEFAULT ''",
             "tag_channel_topic_group": "TEXT NOT NULL DEFAULT ''",
             "tag_channel_style_key": "TEXT NOT NULL DEFAULT ''",
             "tag_channel_temporal_class": "TEXT NOT NULL DEFAULT 'unknown'",
@@ -13735,6 +13859,10 @@ class Database:
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_discovery_candidates_temporal_retry "
             "ON discovery_candidates(status, temporal_review_retry_at, id)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_discovery_candidates_profile_digest "
+            "ON discovery_candidates(profile_digest)"
         )
 
     def _normalize_legacy_style_keys(self) -> None:
@@ -14033,6 +14161,27 @@ class Database:
             self.conn.execute(
                 "ALTER TABLE confusions ADD COLUMN replay_queue TEXT NOT NULL DEFAULT '[]'"
             )
+
+    def _ensure_evaluation_context_snapshots_table(self) -> None:
+        """Create the eval-time compact profile snapshot table on existing DBs."""
+
+        self.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS evaluation_context_snapshots (
+                profile_digest         TEXT NOT NULL,
+                negative_digest        TEXT NOT NULL,
+                schema_version         INTEGER NOT NULL DEFAULT 1,
+                profile_summary_json   TEXT NOT NULL,
+                recall_pool_json       TEXT NOT NULL DEFAULT '[]',
+                negative_examples_json TEXT NOT NULL DEFAULT '[]',
+                created_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_seen_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (profile_digest, negative_digest)
+            );
+            CREATE INDEX IF NOT EXISTS idx_evaluation_context_snapshots_seen
+                ON evaluation_context_snapshots(last_seen_at);
+            """
+        )
 
     def _ensure_recommendation_impressions_table(self) -> None:
         """Create the ML-ranking impression ledger on pre-migration databases."""

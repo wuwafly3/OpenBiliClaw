@@ -725,6 +725,7 @@ class RuntimeContext:
         from openbiliclaw.llm.registry import build_embedding_service
         from openbiliclaw.llm.service import LLMService, module_overrides_from_config
         from openbiliclaw.llm.usage_recorder import UsageRecorder
+        from openbiliclaw.ml.inference import resolve_model_path
         from openbiliclaw.recommendation.engine import RecommendationEngine
         from openbiliclaw.runtime.account_sync import AccountSyncService
         from openbiliclaw.runtime.refresh import ContinuousRefreshController
@@ -1011,6 +1012,11 @@ class RuntimeContext:
             ),
             eval_prefilter_mode=str(getattr(discovery_cfg, "eval_prefilter_mode", "shadow")),
             tag_channel_mode=str(getattr(discovery_cfg, "tag_channel_mode", "off")),
+            relevance_scorer=str(getattr(discovery_cfg, "relevance_scorer", "llm")),
+            relevance_model_path=resolve_model_path(
+                getattr(discovery_cfg, "relevance_model_path", ""),
+                new_config.data_path,
+            ),
         )
         search_strategy = SearchStrategy(
             llm_service=new_llm_service,

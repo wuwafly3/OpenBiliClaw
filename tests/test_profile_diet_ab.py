@@ -2936,7 +2936,7 @@ def test_compact_arm_b_uses_exact_production_profile_view() -> None:
 
     assert engine._evaluation_profile_summary(  # noqa: SLF001
         profile
-    ) == ContentDiscoveryEngine._evaluation_profile_summary(profile)  # noqa: SLF001
+    ) == ContentDiscoveryEngine(llm_service=None)._evaluation_profile_summary(profile)  # noqa: SLF001
 
 
 @pytest.mark.asyncio

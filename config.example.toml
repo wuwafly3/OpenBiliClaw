@@ -601,6 +601,12 @@ eval_prefilter_mode = "shadow"
 # shadow = 后台抽样打标，不改变 admission；enforce = pending_eval 先打标再跑完整评估。
 # 非法值在保存时拒绝。在 Task 7 探针数字出来之前不要把线上 daemon 设为 enforce。
 tag_channel_mode = "off"
+# Wave 1 准入 scorer：llm = 现行教师评估（默认）；shadow = numpy 推理旁路对照，
+# 不改 admission；ml 配置可保存但仍观察性运行，不跳过 evaluate_batch（S1.5 未过）。
+# 非法值在保存时拒绝。artifact 缺文件 / 版本不匹配 fail-open 回 LLM。
+relevance_scorer = "llm"
+# 空 = {data_dir}/ml_artifacts/admission_teacher_v1.json
+relevance_model_path = ""
 # 可选封面图评估。默认关闭；开启后 discovery evaluator 会在模型支持图像输入时
 # 把已压缩的候选封面一并送入评估器，模型不支持时自动退回纯文本评估。
 multimodal_evaluation_enabled = false

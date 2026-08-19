@@ -47,14 +47,32 @@
    **禁** `topic_group` / `style_key` / `franchise_key` / `temporal_*`（标签泄漏；
    多任务原型证实自预测 tags 只能挽回该信息约 4% 增量，两阶段辅助头方案
    已按 2026-08-16 复核降级为证据，见 `docs/plans/2026-08-16-ml-multitask-probe.md`）。
+   **2026-08-19：** 共享编码器已落地（无文本 PCA；廉价 tags 来自 `tag_channel_*`，
+   训练仍可用教师 tags 作 oracle）。
 2. `pyproject.toml` 新增 `[ml]` extra（训练用 numpy / scikit-learn 显式声明），
    运行时推理只依赖 numpy；numpy 从"环境偶然可用"提升为显式依赖。
+   **2026-08-19：** numpy 已进入默认运行时依赖；scikit-learn 仍仅 `[ml]` extra。
 3. `scripts/train_relevance_model.py`：离线训练浅模型（logistic / 浅 GBDT），
    输出版本化 artifact（权重 + 特征名 + 特征版本 + 训练集指纹）。
+   **2026-08-19：** 教师 oracle 初训入口已落地（logistic + OOF isotonic，
+   `tags_source=teacher_oracle`）。S1.5 数字是 holdout 测量项，不是合入门槛。
+   浅 GBDT 仍待后续切片。
+   **2026-08-19：** `scripts/ml_teacher_self_consistency_probe.py` 测同一 pinned
+   教师（默认 `openai-4`，精确 `openai/deepseek-v4-flash`）的准入自洽，作为
+   agreement 理论天花板；不混 `openai_compatible`。live 90 条
+   `openai-4` 复测 agreement **0.711**，与 ML@0.70 的 0.699 同档。见
+   [`2026-08-19-ml-teacher-self-consistency-probe.md`](./2026-08-19-ml-teacher-self-consistency-probe.md)。
+   **2026-08-19：** 评估上下文快照（步骤 1–2）已落地：教师行打
+   `profile_digest` / `negative_digest`，compact 画像 + 负例写入
+   `evaluation_context_snapshots`；探针按 digest 分组回放。历史行仍无快照。
+   见 [`2026-08-19-ml-eval-context-snapshot-spec.md`](./2026-08-19-ml-eval-context-snapshot-spec.md)。
 4. `ml/inference.py`：纯 numpy 推理 + artifact 版本校验 + fail-open 回落 LLM。
+   **2026-08-19：** 已接入 `evaluate_content(_batch)`；默认 `relevance_scorer=llm`。
 5. 配置开关 `[discovery].relevance_scorer = "llm" | "shadow" | "ml"`，默认 `llm`；
    config 校验 + round-trip 测试；API / CLI / RuntimeContext 三个组装根注入。
+   **2026-08-19：** 开关与三处装配已落地。`ml` 仍观察性，不跳过评估。
 6. `shadow` 模式：ML 与 LLM 同时判定，分歧写 `ranking_feature_log`，不影响准入。
+   **2026-08-19：** 分歧先打隐私安全日志（平台/策略/0-1）；`ranking_feature_log` 表仍待 Wave 0。
 7. `scripts/evaluate_relevance_distillation.py`：算 spec S1.5 六项门槛
    （AUC / 一致率 / FPR / FNR / Brier / 分平台分层）。
 8. 阈值重标定 **C1–C7 全部 7 个常数**（§3.1）：准入线按 FPR/FNR 权衡选点，
@@ -90,9 +108,9 @@
    ML 推理块与训练 artifact 依赖。
 4. README CN/EN 📌 highlights 替换（≤4 条，CN/EN 同步）。
 
-## 当前状态（实测）
-
-- ✅ **曝光账本已落地并合并到 main**（commit `de7de536`）。
+- **2026-08-19 Wave 1 推理：** `ml/features.py` + `ml/inference.py` 已接入
+  `evaluate_content(_batch)`。默认 `relevance_scorer=llm`；`shadow`/`ml` 观察性打分，
+  不跳过 LLM、不改 admission。未在 live daemon 打开。
 - **人类正样本约 50 条**（like 16 + favorite 关联部分）→ 低于 Wave 2 门槛 200，
   采集进行中。
 - **教师分对 like/dislike 的 AUC = 0.4513** → Wave 1 只声称成本，不声称质量。

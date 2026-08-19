@@ -674,6 +674,7 @@ Agent 宿主（OpenClaw / Hermes / WorkBuddy）
 ├─────────┬──────────┬───────────┬───────────────┤
 │  Soul   │  Memory  │ Discovery │ Recommendation │
 │ 灵魂画像 │ 五层记忆  │多源发现+准入│   推荐与表达     │
+│         │          │(+ML shadow)│                │
 ├─────────┴──────────┴───────────┴───────────────┤
 │ 普通事件/推荐点击 → generic durable cursor ─┐    │
 │ 内容反馈 → content_feedback durable cursor ─┴→ buffer+cursor 同一原子 checkpoint │

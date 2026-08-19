@@ -671,6 +671,7 @@ images: proxy foreground + refresh prefetch → app-stable lane (total 4 / bg 3,
 │  Soul   │  Memory  │ Discovery │ Recommendation │
 │ Engine  │  System  │Discovery +│     Engine     │
 │         │          │ Admission │                │
+│         │          │(+ML shadow)│               │
 ├─────────┴──────────┴───────────┴───────────────┤
 │ Events/recommendation clicks → generic durable cursor ─┐ │
 │ Content feedback → content_feedback durable cursor ────┴→ atomic buffer+cursor checkpoint │

@@ -16915,6 +16915,8 @@ def create_app(
                 admission_min_score=cfg.discovery.admission_min_score,
                 eval_prefilter_mode=cfg.discovery.eval_prefilter_mode,
                 tag_channel_mode=cfg.discovery.tag_channel_mode,
+                relevance_scorer=cfg.discovery.relevance_scorer,
+                relevance_model_path=cfg.discovery.relevance_model_path,
                 candidate_eval_concurrency=cfg.discovery.candidate_eval_concurrency,
                 multimodal_evaluation_enabled=cfg.discovery.multimodal_evaluation_enabled,
                 visual_profile_enabled=cfg.discovery.visual_profile_enabled,
@@ -19343,6 +19345,18 @@ def create_app(
                             detail="discovery.tag_channel_mode must be off, shadow, or enforce",
                         )
                     cfg.discovery.tag_channel_mode = tag_channel_mode
+                if "relevance_scorer" in ddata:
+                    relevance_scorer = str(ddata["relevance_scorer"] or "").strip().lower()
+                    if relevance_scorer not in {"llm", "shadow", "ml"}:
+                        raise HTTPException(
+                            status_code=422,
+                            detail="discovery.relevance_scorer must be llm, shadow, or ml",
+                        )
+                    cfg.discovery.relevance_scorer = relevance_scorer
+                if "relevance_model_path" in ddata:
+                    cfg.discovery.relevance_model_path = str(
+                        ddata["relevance_model_path"] or ""
+                    ).strip()
                 for key, (default, min_value, max_value) in discovery_int_limits.items():
                     if key in ddata:
                         setattr(

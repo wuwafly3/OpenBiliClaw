@@ -3662,7 +3662,7 @@ def _build_engine(
                 return build_profile_summary(profile)
             # Production owns the compact view. Applying the transform again
             # would let replay drift if it ever stops being idempotent.
-            return ContentDiscoveryEngine._evaluation_profile_summary(profile)
+            return super()._evaluation_profile_summary(profile)
 
         async def _related_interests_for_content(
             self,

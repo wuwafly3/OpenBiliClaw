@@ -48,6 +48,9 @@ dependencies = [
     "pydantic>=2.0",
     "apscheduler>=3.10",
     "uvicorn>=0.32",
+    # Runtime admission inference (Wave 1). Training-only scikit-learn stays in
+    # the ``[ml]`` extra; the daemon forward pass is numpy-only.
+    "numpy>=1.26",
 ]
 
 [project.optional-dependencies]
@@ -68,6 +71,10 @@ x = [
 ]
 eval = [
     "claude-agent-sdk>=0.1",
+]
+ml = [
+    "numpy>=1.26",
+    "scikit-learn>=1.5",
 ]
 browser = [
     "playwright>=1.40",
@@ -139,6 +146,13 @@ module = [
     "x_client_transaction.*",
 ]
 ignore_missing_imports = true
+
+# numpy 2.5 stubs use PEP 695 `type` statements. Skip stubs so mypy's 3.11
+# target can still type-check the rest of src/.
+[[tool.mypy.overrides]]
+module = ["numpy", "numpy.*"]
+follow_imports = "skip"
+follow_imports_for_stubs = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1077,6 +1077,8 @@ class DiscoveryCandidatePipeline:
                     "score_source": item.score_source,
                     "llm_score_raw": item.llm_score_raw,
                     "teacher_model": item.teacher_model,
+                    "profile_digest": item.profile_digest,
+                    "negative_digest": item.negative_digest,
                     "temporal_class": item.temporal_class,
                     "temporal_confidence": item.temporal_confidence,
                     "temporal_reason": item.temporal_reason,

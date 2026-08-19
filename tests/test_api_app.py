@@ -240,6 +240,8 @@ def test_discovery_config_response_defaults_to_hybrid_with_visual_features_off()
 
     assert config.keyword_generation_mode == "hybrid"
     assert config.tag_channel_mode == "off"
+    assert config.relevance_scorer == "llm"
+    assert config.relevance_model_path == ""
     assert config.multimodal_evaluation_enabled is False
     assert config.visual_profile_enabled is False
     assert config.keyframe_enabled is False

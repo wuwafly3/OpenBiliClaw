@@ -301,6 +301,8 @@ def _evaluation(
     llm_score_raw: float | None,
     relevance_score: float = 0.0,
     teacher_model: str = "",
+    profile_digest: str = "",
+    negative_digest: str = "",
 ) -> dict[str, object]:
     return {
         "candidate_id": candidate_id,
@@ -310,6 +312,8 @@ def _evaluation(
         "score_source": score_source,
         "llm_score_raw": llm_score_raw,
         "teacher_model": teacher_model,
+        "profile_digest": profile_digest,
+        "negative_digest": negative_digest,
         "temporal_class": "unknown",
         "temporal_confidence": 0.0,
         "temporal_policy_version": "v1",
@@ -490,8 +494,12 @@ async def test_non_teacher_paths_leave_teacher_model_empty(tmp_path: Path) -> No
 
     assert filtered.score_source == "prefilter"
     assert filtered.teacher_model == ""
+    assert filtered.profile_digest == ""
+    assert filtered.negative_digest == ""
     assert viewed.score_source == "viewed"
     assert viewed.teacher_model == ""
+    assert viewed.profile_digest == ""
+    assert viewed.negative_digest == ""
 
 
 def test_evaluation_persist_round_trips_teacher_model(tmp_path: Path) -> None:
@@ -519,3 +527,79 @@ def test_evaluation_persist_round_trips_teacher_model(tmp_path: Path) -> None:
 
     teacher_rows = database.get_teacher_labeled_discovery_candidates()
     assert teacher_rows[0]["teacher_model"] == "deepseek/deepseek-v4-flash"
+
+
+def test_evaluation_persist_round_trips_profile_and_negative_digest(tmp_path: Path) -> None:
+    database = Database(tmp_path / "eval-digest-roundtrip.db")
+    database.initialize()
+    candidate_id = _enqueue_and_claim(database, "BV_PROV_DIGEST")
+
+    updated = database.update_discovery_candidate_evaluations(
+        [
+            _evaluation(
+                candidate_id,
+                score_source="llm",
+                llm_score_raw=0.81,
+                teacher_model="openai/deepseek-v4-flash",
+                profile_digest="abc123profiledigest0001",
+                negative_digest="def456negativedigest0001",
+            )
+        ]
+    )
+    assert updated == 1
+
+    row = database.conn.execute(
+        "SELECT profile_digest, negative_digest FROM discovery_candidates WHERE id = ?",
+        (candidate_id,),
+    ).fetchone()
+    assert row["profile_digest"] == "abc123profiledigest0001"
+    assert row["negative_digest"] == "def456negativedigest0001"
+
+    teacher_rows = database.get_teacher_labeled_discovery_candidates()
+    assert teacher_rows[0]["profile_digest"] == "abc123profiledigest0001"
+    assert teacher_rows[0]["negative_digest"] == "def456negativedigest0001"
+
+
+@pytest.mark.asyncio
+async def test_batch_llm_scores_stamp_evaluation_context_and_snapshot(tmp_path: Path) -> None:
+    database = Database(tmp_path / "eval-ctx-stamp.db")
+    database.initialize()
+    engine = ContentDiscoveryEngine(
+        llm_service=_ModelStampedBatchLLMService(),
+        database=database,
+        eval_prefilter_mode="off",
+    )
+    contents = [DiscoveredContent(bvid="BV_CTX_STAMP", title="候选", source_strategy="search")]
+
+    await engine.evaluate_content_batch(contents, _build_profile())
+
+    assert contents[0].score_source == "llm"
+    assert contents[0].profile_digest
+    assert contents[0].negative_digest
+    snapshot = database.get_evaluation_context_snapshot(
+        profile_digest=contents[0].profile_digest,
+        negative_digest=contents[0].negative_digest,
+    )
+    assert snapshot is not None
+    assert snapshot.digests_match()
+
+
+@pytest.mark.asyncio
+async def test_evaluation_context_override_freezes_prompt_when_live_profile_mutates() -> None:
+    llm = _DynamicBatchLLMService()
+    engine = ContentDiscoveryEngine(llm_service=llm, eval_prefilter_mode="off")
+    profile = _build_profile()
+    snapshot = engine._build_live_evaluation_context(profile)
+    frozen_marker = "纪录片"
+    profile.preferences.interests[0].name = "不应出现在冻结评估prompt里"
+
+    engine._evaluation_context_override = snapshot
+    contents = [DiscoveredContent(bvid="BV_CTX_FROZEN", title="候选", source_strategy="search")]
+    await engine.evaluate_content_batch(contents, profile)
+
+    assert llm.user_inputs, "expected a batch eval prompt"
+    prompt = llm.user_inputs[0]
+    assert frozen_marker in prompt
+    assert "不应出现在冻结评估prompt里" not in prompt
+    assert contents[0].profile_digest == snapshot.profile_digest
+    assert engine._evaluation_profile_digest(profile) == snapshot.profile_digest

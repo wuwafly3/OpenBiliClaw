@@ -128,18 +128,21 @@ manual `discover --source douyin` → same Douyin producer as daemon
 source-scoped cache backfill → strategy source_platform set → SQL filter before balance/LIMIT
                              → only that platform can supplement an underfilled run
 
-candidate evaluation → effective profile view + exact tail-recall pool + negative exemplars
+candidate evaluation → freeze compact profile + negatives (evaluation_context_snapshots)
+                     → effective profile view + exact tail-recall pool + negative exemplars
                      → prompt-visible content/context digest + embedding namespace
                      → normal eval LRU lookup ─hit─→ relevance + atomic temporal evidence → caller-group diversity caps
-                     └─miss─→ complete recall → LLM batch → time-neutral relevance + temporal v2 evidence group
-                               → discovery_candidates → eligible/review_due/expired → content_cache/hold/stale
+                     └─miss─→ optional numpy admission score (shadow/ml; fail-open)
+                               → complete recall → LLM batch → time-neutral relevance + temporal v2 evidence group
+                               → discovery_candidates (incl. profile_digest/negative_digest on teacher rows)
+                               → eligible/review_due/expired → content_cache/hold/stale
                                → publication bonus → pre-serve retirement → final atomic eligibility recheck
                                embedding/recall degraded ───────────────→ no normal-cache write
 ```
 
 1. **用户交互层** — Chrome / Firefox 插件负责受支持站点的普通行为采集、登录态只读任务与侧边栏；Linux.do / V2EX / 微博使用隔离任务 tab，微博普通页面不做行为采集。插件与移动 Web（`/m`）、桌面 Web（`/web`）共用本地 API；可选密码门禁保护局域网 / 远程访问。
 2. **外部集成层** — OpenClaw adapter / skill wrappers / 本地 API / Codex CLI 凭据导入等对外接入边界
-3. **Agent 核心层** — 自研编排器 + Soul Engine + Discovery Engine + Recommendation Engine + Skill System；抖音手动 discovery 与 daemon 共用正式 producer、统一关键词生命周期和待评估候选链，debug-only `discover-douyin` 才直接调用源服务
+3. **Agent 核心层** — 自研编排器 + Soul Engine + Discovery Engine + Recommendation Engine + Skill System；候选评估在 LLM 前可旁路 numpy 准入打分（默认 `relevance_scorer=llm`，shadow/ml 不改 admission）。抖音手动 discovery 与 daemon 共用正式 producer、统一关键词生命周期和待评估候选链，debug-only `discover-douyin` 才直接调用源服务
 4. **LLM 实例路由层** — `config / Web UI -> [llm.instances.<id>] -> 全局或分模块有序实例链 -> LLMRegistry -> Provider adapter`。实例 ID 是路由、健康与 cooldown 身份，adapter 类型只是协议实现，因此同类型的多个 Base URL / token / model 可以同时存在。模块默认继承全局链；自定义链只在链内降级，耗尽后不越界。配置界面另有两条无写入恢复支路：`draft -> /api/config/probe-service -> temporary registry -> stable total gate` 做目标实例/链真实探测，`draft -> /api/config/discover-models -> exact instance GET /models` 只返回模型 ID 与本地 Effort 建议。两者在 active registry 启动失败的 degraded 状态仍精确放行，但不改变配置、不放开业务 API。
    配置写入的实际切换走独立控制流：`UI -> PUT /api/config -> config.toml + .bak -> 202 queued/apply_revision -> app-owned latest-wins queue -> RuntimeContext rebuild -> apply-status/config_reloaded`；失败从 last-good 同时恢复磁盘、proxy 与内存 runtime，再发 `config_reload_failed`。`data_dir` 是例外：新 canonical 路径只持久化并返回 `restart_required=true`，本进程的 rebuild 与外部凭据写仍绑定已锁住的 active data dir，完整重启取得新目录锁后才切换。
    跨机器迁移走第三条、与热重载隔离的控制流：`本机桌面设置 -> export .obcbackup -> 新机器 import(request_id) -> processing(uploading|validating) -> pending -> status 对账 / cancel -> 重启`。导出数据固定来自本进程已锁住的 active data dir；导入端点从不替换 live `Database` / `MemoryManager` 或 UI 偏好。断连后的桌面端保留 request ID，最多强制查 3 次并对 `idle/cancelled` 间隔 500ms 再确认；每次打开「通用」也强制查询。只有下一进程先同时取得项目与 canonical data-dir runtime lock，才通过 journaled replace 激活配置和数据；成功回执用配置 SHA-256 + 严格递增 DB epoch 绑定活动代际，使断电后复活的旧 marker 只能被验证、清理而不能重放。status 报告 `applied` 后，桌面端按 `migration_id` 在每个浏览器只应用一次白名单偏好，避免旧 status 覆盖用户后续修改。来源包会移除整段 `[api.auth]`，机器专属路径 / 网络字段和目标机整段 `api.auth` 继续作为基线；应用时再轮换文件 session secret、把数据库 auth epoch 严格提升到来源 / 目标当前值之上，并关闭 / 清空扩展设备访问。
@@ -493,7 +496,7 @@ embedding 和空向量失败留待下轮重试，成功槽位会复用。已有�
 - 候选质量信号持久化与数据迁移；`events` 行写入 `inferred_satisfaction` / `satisfaction_reason`，支持 `query_events(satisfaction_modes=...)`
 - `seen_items` 是 discovery / recommendation 共用的无界已看身份账本；`insert_event` 与 `insert_events_batch` 同事务维护，`seen_items_backfill_state` 让升级回填幂等且增量
 - `get_pool_candidates` 与 canonical availability loader 共用每个 `topic_group` ≤3 条的窗口：先执行 durable seen / linkability gate，再按 topic 内 relevance / score time / view / bvid 排名选前三，最后恢复全局 candidate-tier / relevance 顺序。这样长尾 group 能进入窗口，已看或不可打开的高分行也不会先占掉公开槽位
-- `discovery_candidates` 持久化所有来源 raw candidates 的 lifecycle：`pending_eval`、`evaluating`、`evaluated`、`cached`、`rejected_low_score`、`rejected_duplicate`、`rejected_cache_admission`、`rejected_temporal_stale`、`rejected_recently_viewed`、`rejected_franchise_quota`、`failed_eval`、`trimmed_capacity`；容量 victim 与时效拒绝都保留 terminal 行和 `eval_error` 原因，不做物理删除。
+- `discovery_candidates` 持久化所有来源 raw candidates 的 lifecycle：`pending_eval`、`evaluating`、`evaluated`、`cached`、`rejected_low_score`、`rejected_duplicate`、`rejected_cache_admission`、`rejected_temporal_stale`、`rejected_recently_viewed`、`rejected_franchise_quota`、`failed_eval`、`trimmed_capacity`；容量 victim 与时效拒绝都保留 terminal 行和 `eval_error` 原因，不做物理删除。教师判定行另存打标时刻 `profile_digest` / `negative_digest`；compact 画像与负例正文在 `evaluation_context_snapshots`（本地、无人格素描）。
 - evaluator embedding prefilter 默认保持 shadow。`discovery.prefilter_audit` 先把不含候选文本/URL/画像正文的 decision（identity hash、平台/上下文 class、相似度阈值、explore/保护位、embedding/profile digest）写入 `evaluator_prefilter_shadow_audit`，provider 返回后按随机 decision id 回填 diversity cap 之前的原始 LLM score 与统一 admission 判定。表按 30 天和 20,000 行双重有界；required-interest 和 embedding 输入共享权重排序后的 top-256。embedding 或 telemetry 任一异常都把候选留在 LLM 路径：显式 `enforce` 也只有在本批每条决策证据完整落库后才允许剔除，否则整批 fail-open；§6.4 gate 会因 coverage/fail-open 证据不足保持关闭。只读 gate 只报告，不写 `eval_prefilter_mode`。
 - `discovery_inspiration_probe_cache` / `discovery_inspiration_expansion_cache` 持久化 query inspiration 搜索探针、横向扩展、curator 判断和 yield 反馈；`discovery_interest_selection_ledger` 记录二级兴趣抽中事件，让兴趣被抽到后立即进入冷却而不必等待 keyword yield；`discovery_keywords` 可携带 aspect / inspiration / expansion / angle 元数据，但不改变原有 in-flight 去重键。`KeywordPlanner` 的 inspiration-only 分支会从 selection ledger / keyword / raw candidate / admitted pool 构建二级兴趣 coverage snapshot，经过 brainstorm → provider-chain grounding → curator → deterministic quota / explore validation → bounded repair 后写入各平台关键词池；`keyword-inspiration-dry-run` 复用同一路径但跳过关键词写库，并使用独立 preview selection scope 做真实请求诊断。
 - `count_pool_available_candidates_by_source()` 与 `count_pool_candidates()` 保持前端可见口径一致；`count_pool_raw_material_by_source()` 统计 fresh / 非 dislike / 未推荐 / 未命中 `seen_items` 的 `content_cache` raw material，并合并 `discovery_candidates` 中待评估 / 已评估未缓存的 raw material，供 runtime raw ceiling headroom 和 trim 使用。两类来源统计及已看身份都通过 `sources.platforms` 归一，`zhihu-*` 等 strategy 可覆盖旧缓存的 Bilibili 默认平台。

@@ -27,6 +27,7 @@ from openbiliclaw.llm.concurrency import LLMConcurrencyGate, background_llm_conc
 from openbiliclaw.llm.service import LLMService, module_overrides_from_config
 from openbiliclaw.llm.usage_recorder import UsageRecorder
 from openbiliclaw.memory.manager import MemoryManager
+from openbiliclaw.ml.inference import resolve_model_path
 from openbiliclaw.recommendation.engine import RecommendationEngine
 from openbiliclaw.runtime.account_sync import AccountSyncService
 from openbiliclaw.runtime.event_ingress import EventIngressService
@@ -255,6 +256,11 @@ def build_openclaw_adapter_services() -> OpenClawAdapterServices:
         concurrency=concurrency,
         eval_prefilter_mode=str(getattr(discovery_cfg, "eval_prefilter_mode", "shadow")),
         tag_channel_mode=str(getattr(discovery_cfg, "tag_channel_mode", "off")),
+        relevance_scorer=str(getattr(discovery_cfg, "relevance_scorer", "llm")),
+        relevance_model_path=resolve_model_path(
+            getattr(discovery_cfg, "relevance_model_path", ""),
+            config.data_path,
+        ),
     )
     search_strategy = SearchStrategy(
         llm_service=llm_service,

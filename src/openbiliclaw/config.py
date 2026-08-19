@@ -153,6 +153,8 @@ _DEFAULT_EVAL_PREFILTER_MODE = "shadow"
 _SUPPORTED_EVAL_PREFILTER_MODES = {"off", "shadow", "enforce"}
 _DEFAULT_TAG_CHANNEL_MODE = "off"
 _SUPPORTED_TAG_CHANNEL_MODES = {"off", "shadow", "enforce"}
+_DEFAULT_RELEVANCE_SCORER = "llm"
+_SUPPORTED_RELEVANCE_SCORERS = {"llm", "shadow", "ml"}
 _DEFAULT_MULTIMODAL_BATCH_SIZE = 8
 _DEFAULT_MULTIMODAL_IMAGE_MAX_PX = 384
 _DEFAULT_MULTIMODAL_IMAGE_QUALITY = 72
@@ -1085,6 +1087,12 @@ class DiscoveryConfig:
     # extra calls. ``shadow`` is a backfill/probe path, not the claim hot path.
     # ``enforce`` tags pending_eval before full eval still runs.
     tag_channel_mode: str = _DEFAULT_TAG_CHANNEL_MODE
+    # Wave 1 admission scorer. ``llm`` is the production path. ``shadow``
+    # runs numpy inference beside the teacher and never changes admission.
+    # ``ml`` is accepted but still observational until S1.5 gates pass.
+    relevance_scorer: str = _DEFAULT_RELEVANCE_SCORER
+    # Empty = ``{data_dir}/ml_artifacts/admission_teacher_v1.json``.
+    relevance_model_path: str = ""
     # Optional cover-image evaluation. Kept off by default because it changes
     # LLM cost/latency and requires a vision-capable evaluation model.
     multimodal_evaluation_enabled: bool = False
@@ -2700,6 +2708,8 @@ def _build_discovery(discovery_raw: dict[str, Any]) -> DiscoveryConfig:
             discovery_raw.get("eval_prefilter_mode")
         ),
         tag_channel_mode=_normalize_tag_channel_mode(discovery_raw.get("tag_channel_mode")),
+        relevance_scorer=_normalize_relevance_scorer(discovery_raw.get("relevance_scorer")),
+        relevance_model_path=(str(discovery_raw.get("relevance_model_path") or "").strip()),
         multimodal_evaluation_enabled=_coerce_bool(
             discovery_raw.get("multimodal_evaluation_enabled"),
             default=False,
@@ -2794,6 +2804,13 @@ def _normalize_tag_channel_mode(value: object) -> str:
         return _DEFAULT_TAG_CHANNEL_MODE
     mode = value.strip().lower()
     return mode or _DEFAULT_TAG_CHANNEL_MODE
+
+
+def _normalize_relevance_scorer(value: object) -> str:
+    if not isinstance(value, str):
+        return _DEFAULT_RELEVANCE_SCORER
+    mode = value.strip().lower()
+    return mode or _DEFAULT_RELEVANCE_SCORER
 
 
 def _coerce_bool(value: object, *, default: bool = False) -> bool:
@@ -4253,6 +4270,16 @@ def _collect_config_issues(config: Config) -> list[ConfigIssue]:
             )
         )
 
+    relevance_scorer = str(config.discovery.relevance_scorer or "").strip().lower()
+    if relevance_scorer not in _SUPPORTED_RELEVANCE_SCORERS:
+        issues.append(
+            ConfigIssue(
+                field="discovery.relevance_scorer",
+                message='`discovery.relevance_scorer` 仅支持: "llm", "shadow", "ml"。',
+                severity="blocking",
+            )
+        )
+
     return issues
 
 
@@ -5285,6 +5312,8 @@ def _render_config_toml(
             f"inspiration_breadth = {_toml_string(config.discovery.inspiration_breadth)}",
             f"eval_prefilter_mode = {_toml_string(config.discovery.eval_prefilter_mode)}",
             f"tag_channel_mode = {_toml_string(config.discovery.tag_channel_mode)}",
+            f"relevance_scorer = {_toml_string(config.discovery.relevance_scorer)}",
+            f"relevance_model_path = {_toml_string(config.discovery.relevance_model_path)}",
             "multimodal_evaluation_enabled = "
             f"{_toml_bool(config.discovery.multimodal_evaluation_enabled)}",
             f"visual_profile_enabled = {_toml_bool(config.discovery.visual_profile_enabled)}",

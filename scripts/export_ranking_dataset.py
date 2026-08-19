@@ -95,6 +95,8 @@ CANDIDATE_COLUMNS = (
     "score_source",
     "llm_score_raw",
     "teacher_model",
+    "profile_digest",
+    "negative_digest",
     "style_key",
     "temporal_class",
     "topic_group",
@@ -205,7 +207,7 @@ def build_export_rows(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], C
     columns = [column for column in CANDIDATE_COLUMNS if column in existing]
     placeholders = ", ".join("?" for _ in EVALUATED_STATUSES)
     rows = conn.execute(
-        f"""SELECT {', '.join(columns)}
+        f"""SELECT {", ".join(columns)}
             FROM discovery_candidates
             WHERE status IN ({placeholders})""",
         EVALUATED_STATUSES,
@@ -237,6 +239,8 @@ def build_export_rows(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], C
             "label_policy": policy,
             "score_source": str(record.get("score_source") or ""),
             "teacher_model": str(record.get("teacher_model") or ""),
+            "profile_digest": str(record.get("profile_digest") or ""),
+            "negative_digest": str(record.get("negative_digest") or ""),
             "y": 1 if teacher_score >= threshold else 0,
             "admission_threshold": threshold,
             "aux_labels": {

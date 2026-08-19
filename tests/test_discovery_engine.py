@@ -544,7 +544,7 @@ def test_content_prompt_profile_compactor_is_eval_backcompat_alias() -> None:
 def test_evaluation_profile_summary_uses_compactor_and_preserves_dislikes() -> None:
     profile = _maxed_onion_profile()
 
-    summary = ContentDiscoveryEngine._evaluation_profile_summary(profile)
+    summary = ContentDiscoveryEngine(llm_service=None)._evaluation_profile_summary(profile)
     expected = compact_evaluation_profile_summary(build_profile_summary(profile))
     full_summary = build_profile_summary(profile)
 
@@ -637,7 +637,7 @@ def test_compact_evaluation_profile_summary_strips_recent_context_volatile_field
 def test_evaluation_profile_prompt_block_shrinks_by_at_least_sixty_percent() -> None:
     profile = _maxed_onion_profile()
     full_summary = build_profile_summary(profile)
-    compacted = ContentDiscoveryEngine._evaluation_profile_summary(profile)
+    compacted = ContentDiscoveryEngine(llm_service=None)._evaluation_profile_summary(profile)
     full_block = "\n\n".join(
         PromptLayerRenderCache().render_json_layers(evaluation_profile_prompt_layers(full_summary))
     )

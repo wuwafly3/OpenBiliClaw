@@ -1125,12 +1125,16 @@ def test_build_openclaw_adapter_services_reuses_shared_database(
             concurrency: object = None,
             eval_prefilter_mode: str = "shadow",
             tag_channel_mode: str = "off",
+            relevance_scorer: str = "llm",
+            relevance_model_path: str = "",
         ) -> None:
             self.llm_service = llm_service
             self.database = database
             self.concurrency = concurrency
             self.eval_prefilter_mode = eval_prefilter_mode
             self.tag_channel_mode = tag_channel_mode
+            self.relevance_scorer = relevance_scorer
+            self.relevance_model_path = relevance_model_path
 
         def register_strategy(self, strategy: object) -> None:
             registered_strategies.append(str(getattr(strategy, "name", "")))
@@ -1289,6 +1293,7 @@ def test_build_openclaw_adapter_services_reuses_shared_database(
     assert services.discovery_engine.concurrency.llm_evaluation_concurrency == 2
     assert services.discovery_engine.eval_prefilter_mode == "enforce"
     assert services.discovery_engine.tag_channel_mode == "off"
+    assert services.discovery_engine.relevance_scorer == "llm"
     assert services.recommendation_engine.kwargs["copy_ready_target_count"] == (
         expected_copy_target
     )

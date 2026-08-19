@@ -2772,6 +2772,8 @@ class TestDiscoveryConfig:
         assert config.discovery.inspiration_breadth == "high"
         assert config.discovery.eval_prefilter_mode == "shadow"
         assert config.discovery.tag_channel_mode == "off"
+        assert config.discovery.relevance_scorer == "llm"
+        assert config.discovery.relevance_model_path == ""
         assert config.discovery.multimodal_evaluation_enabled is False
         assert config.discovery.visual_profile_enabled is False
         assert config.discovery.keyframe_enabled is False
@@ -2805,6 +2807,8 @@ class TestDiscoveryConfig:
         assert config.discovery.inspiration_breadth == "high"
         assert config.discovery.eval_prefilter_mode == "shadow"
         assert config.discovery.tag_channel_mode == "off"
+        assert config.discovery.relevance_scorer == "llm"
+        assert config.discovery.relevance_model_path == ""
         assert config.discovery.multimodal_evaluation_enabled is False
         assert config.discovery.visual_profile_enabled is False
         assert config.discovery.keyframe_enabled is False
@@ -2819,6 +2823,8 @@ class TestDiscoveryConfig:
 
         assert example["discovery"]["eval_prefilter_mode"] == "shadow"
         assert example["discovery"]["tag_channel_mode"] == "off"
+        assert example["discovery"]["relevance_scorer"] == "llm"
+        assert example["discovery"]["relevance_model_path"] == ""
         assert example["discovery"]["inspiration_search_enabled"] is True
         assert example["discovery"]["inspiration_replace_merged_keywords"] is False
         assert example["discovery"]["multimodal_evaluation_enabled"] is False
@@ -3063,6 +3069,31 @@ tag_channel_mode = "  Enforce  "
         with pytest.raises(ConfigError, match="discovery\\.tag_channel_mode"):
             validate_runtime_config(config)
 
+    def test_discovery_relevance_scorer_normalizes_from_toml(self, tmp_path: Path) -> None:
+        toml_path = tmp_path / "c.toml"
+        toml_path.write_text(
+            """
+[discovery]
+relevance_scorer = "  Shadow  "
+relevance_model_path = "data/ml_artifacts/custom.json"
+""".strip(),
+            encoding="utf-8",
+        )
+
+        config = load_config(toml_path)
+
+        assert config.discovery.relevance_scorer == "shadow"
+        assert config.discovery.relevance_model_path == "data/ml_artifacts/custom.json"
+
+    def test_validate_runtime_config_rejects_invalid_relevance_scorer(self) -> None:
+        config = Config()
+        config.llm.default_provider = "ollama"
+        config.llm.ollama.model = "qwen2.5:7b"
+        config.discovery.relevance_scorer = "always"
+
+        with pytest.raises(ConfigError, match="discovery\\.relevance_scorer"):
+            validate_runtime_config(config)
+
     def test_discovery_missing_table_uses_defaults(self, tmp_path: Path) -> None:
         toml_path = tmp_path / "c.toml"
         toml_path.write_text("[scheduler]\nenabled = true\n", encoding="utf-8")
@@ -3161,6 +3192,7 @@ tag_channel_mode = "  Enforce  "
         assert loaded.discovery.inspiration_breadth == "low"
         assert loaded.discovery.eval_prefilter_mode == "enforce"
         assert loaded.discovery.tag_channel_mode == "off"
+        assert loaded.discovery.relevance_scorer == "llm"
         assert loaded.discovery.multimodal_evaluation_enabled is True
         assert loaded.discovery.multimodal_batch_size == 4
         assert loaded.discovery.multimodal_image_max_px == 512
@@ -3187,6 +3219,8 @@ tag_channel_mode = "  Enforce  "
         assert 'inspiration_breadth = "high"' in rendered
         assert 'eval_prefilter_mode = "shadow"' in rendered
         assert 'tag_channel_mode = "off"' in rendered
+        assert 'relevance_scorer = "llm"' in rendered
+        assert 'relevance_model_path = ""' in rendered
         assert "multimodal_evaluation_enabled = false" in rendered
         assert "multimodal_batch_size = 8" in rendered
         assert "multimodal_image_max_px = 384" in rendered
