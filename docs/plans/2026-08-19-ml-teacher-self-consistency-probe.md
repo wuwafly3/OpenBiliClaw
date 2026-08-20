@@ -38,7 +38,43 @@
   噪声天花板。仪表落地后，新教师标签才可按快照回放。
 - 原标签可能来自同名模型的 openai / openai-3 / openai-4 任一实例。
 - 文本-only 复测（关闭 multimodal）。
-- n=90 是成本样本，不是全量 1435。
+- n=90 是成本样本，不是全量池。
+
+## 结果（2026-08-20 live，扩池重测）
+
+同一协议、同一 pinned 实例、同一 seed，池从 exact 1435 扩到 **5459**
+（8-20 当天新打 3092 条 exact）。线上 daemon 仍是 `feat/ml-ranking`，
+**没有** 写入 `profile_digest` / 快照；`--require-snapshot` 仍会抽空。
+90/90 都是当前 effective 画像回放。
+
+```text
+uv run --extra dev python scripts/ml_teacher_self_consistency_probe.py \
+    --config E:/otherproject/OpenBiliClaw/config.toml \
+    --db E:/otherproject/OpenBiliClaw/data/openbiliclaw.db \
+    --instance openai-4 --limit 90 --seed 19 \
+    --out data/ml_artifacts/teacher_self_consistency_v2.json
+```
+
+路由：`default_provider=openai-4`，`fallback_order=['openai-4']`。90/90 复测戳记均为
+`openai/deepseek-v4-flash`。7 次 `discovery.evaluate_batch`，约 ¥2.84。
+不回写 `discovery_candidates` 分数。
+
+| 量 | 2026-08-19 | 2026-08-20 |
+| --- | --- | --- |
+| 白名单 / 丢掉 compatible / exact | 2222 / 787 / 1435 | 6246 / 787 / **5459** |
+| 快照命中 | 0/90 | 0/90 |
+| 教师自洽 agreement | **0.711（64/90）** | **0.667（60/90）** |
+| 混淆 tp/tn/fp/fn | 20 / 44 / 9 / 17 | 30 / 30 / 20 / 10 |
+| FPR / FNR | 0.170 / 0.459 | **0.400** / 0.250 |
+| Spearman ρ / MAE | 0.678 / 0.135 | 0.590 / 0.165 |
+| 近门槛带 | 0.286（4/14） | 0.412（7/17） |
+| 分平台 | yt 0.818 / tw 0.696 / xhs 0.682 / bili 0.652 | yt 0.818 / tw 0.826 / xhs 0.500 / bili 0.522 |
+| ML@0.70 / ML@0.50（对照，未重训） | 0.699 / 0.744 | 同左 |
+| S1.5 | 0.90 | 0.90 |
+
+原 y=1 有 40 条、复测 y=1 变成 50 条：当前画像下教师偏松，FPR 被 bili（fp 9）
+和 xhs（fp 6）拉高。方向与 8-19 那次「偏严、FNR 高」相反，说明这个数仍然
+混着画像漂移，不是稳定的采样噪声上限。
 
 ## 结果（2026-08-19 live）
 
@@ -70,11 +106,12 @@ uv run --extra dev python scripts/ml_teacher_self_consistency_probe.py \
 
 ## 如何读这个数
 
-**教师自洽 0.711 与 ML@0.70 的 0.699 同一档，且低于 ML@0.50 的 0.744。**
-在当前教师（`deepseek-v4-flash`、生产温度 0.7、画像会漂）下，S1.5 的
-agreement≥0.90 **不是模型容量问题，是标签噪声上限**。继续堆同一套特征
-也挤不出 0.90。可选下一步：固定实例+降温度重新采教师、或把 S1.5 一致率
-改成相对教师自洽的比例，而不是绝对 0.90。
+**两次 live 复测（0.711 / 0.667）都与 ML@0.70 的 0.699 同一档，且低于
+ML@0.50 的 0.744，更远低于 S1.5 的 0.90。** 扩池没有抬高天花板，FPR/FNR
+方向还翻了，进一步说明当前协议测到的是「采样噪声 + 画像漂移」，不是纯
+教师自洽。要隔离噪声，需要线上 writer 打上 `evaluation_context_snapshots`
+后再用 `--require-snapshot`。在那之前，把 S1.5 改成相对教师自洽的比例，
+或固定实例+降温度重新采教师，比继续堆同一套特征更有意义。
 
 本探针不改 `[discovery].relevance_scorer`，不跳过 `evaluate_batch`。
 评估上下文快照的 schema 与回放契约见
