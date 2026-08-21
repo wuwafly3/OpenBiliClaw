@@ -26,7 +26,10 @@ from openbiliclaw.discovery.engine import (
     llm_eval_candidate_limit,
 )
 from openbiliclaw.discovery.pool_snapshot import PoolDistributionSnapshot
-from openbiliclaw.discovery.strategies._utils import build_profile_summary
+from openbiliclaw.discovery.strategies._utils import (
+    build_profile_summary,
+    compact_content_prompt_profile_summary,
+)
 from openbiliclaw.llm.prompt_cache import PromptLayerRenderCache
 from openbiliclaw.llm.service import LLMProviderExecutionError
 from openbiliclaw.soul.profile import (
@@ -506,7 +509,7 @@ def test_compact_evaluation_profile_summary_keeps_high_signal_context() -> None:
         ],
     }
 
-    compacted = compact_evaluation_profile_summary(profile_summary)
+    compacted = compact_content_prompt_profile_summary(profile_summary)
 
     assert len(compacted["core_traits"]) == 20
     assert len(compacted["interests"]) == 48
@@ -523,22 +526,27 @@ def test_compact_evaluation_profile_summary_keeps_high_signal_context() -> None:
     assert len(compacted["active_insights"][0]["evidence"]) == 8
     assert len(compacted["speculative_interests"]) == 12
 
+    gate = compact_evaluation_profile_summary(profile_summary)
+    assert "recent_awareness" not in gate
+    assert "active_insights" not in gate
+    assert "speculative_interests" not in gate
+    assert gate["interests"] == compacted["interests"]
+    assert gate["disliked_topics"] == compacted["disliked_topics"]
 
-def test_content_prompt_profile_compactor_is_eval_backcompat_alias() -> None:
-    from openbiliclaw.discovery.strategies._utils import compact_content_prompt_profile_summary
 
+def test_content_prompt_profile_compactor_is_not_the_gate_eval_view() -> None:
     profile_summary = {
         "core_traits": [f"trait-{index}" for index in range(30)],
         "interests": [
             {"name": f"interest-{index}", "weight": 1.0 - index / 100} for index in range(110)
         ],
         "disliked_topics": ["avoid"],
+        "recent_awareness": [{"observation": "session note"}],
     }
 
-    assert compact_evaluation_profile_summary is compact_content_prompt_profile_summary
-    assert compact_content_prompt_profile_summary(profile_summary) == (
-        compact_evaluation_profile_summary(profile_summary)
-    )
+    assert compact_evaluation_profile_summary is not compact_content_prompt_profile_summary
+    assert "recent_awareness" in compact_content_prompt_profile_summary(profile_summary)
+    assert "recent_awareness" not in compact_evaluation_profile_summary(profile_summary)
 
 
 def test_evaluation_profile_summary_uses_compactor_and_preserves_dislikes() -> None:
@@ -573,7 +581,7 @@ def test_evaluation_profile_digest_changes_when_compacted_domain_changes() -> No
     assert engine._evaluation_profile_digest(base) != engine._evaluation_profile_digest(changed)
 
 
-def test_evaluation_profile_digest_ignores_recent_context_timestamps() -> None:
+def test_evaluation_profile_digest_ignores_recent_context() -> None:
     engine = ContentDiscoveryEngine(llm_service=None)
     profile_a = _profile_with_ranked_interests()
     profile_b = _profile_with_ranked_interests()
@@ -581,7 +589,7 @@ def test_evaluation_profile_digest_ignores_recent_context_timestamps() -> None:
         AwarenessNote(date="2026-07-05T10:00:00", observation="最近反复看铁路模型")
     ]
     profile_b.recent_awareness = [
-        AwarenessNote(date="2026-07-05T11:30:00", observation="最近反复看铁路模型")
+        AwarenessNote(date="2026-07-05T11:30:00", observation="这一轮改成看卯榫")
     ]
     profile_a.active_insights = [
         InsightHypothesis(
@@ -592,8 +600,8 @@ def test_evaluation_profile_digest_ignores_recent_context_timestamps() -> None:
     ]
     profile_b.active_insights = [
         InsightHypothesis(
-            hypothesis="偏好慢节奏结构拆解",
-            evidence=["多次看完长视频"],
+            hypothesis="改成短期猎奇",
+            evidence=["点进又退出"],
             created_at="2026-07-05T11:30:00",
         )
     ]
@@ -601,10 +609,41 @@ def test_evaluation_profile_digest_ignores_recent_context_timestamps() -> None:
     assert engine._evaluation_profile_digest(profile_a) == engine._evaluation_profile_digest(
         profile_b
     )
+    for key in ("recent_awareness", "active_insights", "speculative_interests"):
+        assert key not in engine._evaluation_profile_summary(profile_a)
 
 
-def test_compact_evaluation_profile_summary_strips_recent_context_volatile_fields() -> None:
+def test_compact_evaluation_profile_summary_omits_recent_context() -> None:
     compacted = compact_evaluation_profile_summary(
+        {
+            "recent_awareness": [
+                {
+                    "date": "2026-07-05T10:00:00",
+                    "observation": "偏好铁路模型",
+                    "session_context": "run-a",
+                }
+            ],
+            "active_insights": [
+                {
+                    "created_at": "2026-07-05T10:00:00",
+                    "hypothesis": "偏好慢节奏结构拆解",
+                    "session_context": "run-a",
+                    "evidence": ["看完长视频"],
+                }
+            ],
+            "speculative_interests": [{"domain": "试试别的"}],
+            "interests": [{"name": "铁路模型", "weight": 0.9}],
+        }
+    )
+
+    assert "recent_awareness" not in compacted
+    assert "active_insights" not in compacted
+    assert "speculative_interests" not in compacted
+    assert compacted["interests"][0]["name"] == "铁路模型"
+
+
+def test_compact_content_prompt_still_strips_recent_context_volatile_fields() -> None:
+    compacted = compact_content_prompt_profile_summary(
         {
             "recent_awareness": [
                 {
@@ -4771,9 +4810,9 @@ def test_sparse_evaluation_is_the_v6_cache_default_with_explicit_rollback_seams(
     assert _DEFAULT_EVALUATION_CANDIDATE_TRANSPORT == "sparse-json"
     assert default_engine.evaluation_candidate_transport == "sparse-json"
     assert default_key == sparse_key
-    assert default_key.startswith("content-eval-v6:batch:")
+    assert default_key.startswith("content-eval-v7:batch:")
     assert default_key.endswith(":transport:sparse-json")
-    assert explicit_production_key.startswith("content-eval-v6:batch:")
+    assert explicit_production_key.startswith("content-eval-v7:batch:")
     assert ":transport:" not in explicit_production_key
     assert explicit_production_key != default_key
     assert row_key.endswith(":transport:row-wire-v1")
@@ -4789,8 +4828,8 @@ def test_sparse_evaluation_is_the_v6_cache_default_with_explicit_rollback_seams(
         content(),
         profile_digest="profile",
     )
-    assert single_key.startswith("content-eval-v6:single:")
-    old_batch_key = default_key.replace("content-eval-v6:", "content-eval-v5:", 1)
+    assert single_key.startswith("content-eval-v7:single:")
+    old_batch_key = default_key.replace("content-eval-v7:", "content-eval-v6:", 1)
     default_engine._set_eval_cache_entry(
         old_batch_key,
         (0.9, "old", "old", "deep_focus", ""),
@@ -5063,18 +5102,17 @@ async def test_evaluate_batch_only_updates_changed_profile_layers() -> None:
         "profile_life_context",
         "profile_interests",
         "profile_style_context",
+        "profile_recent_context",
     ):
         assert _json_prompt_block(first_input, stable_tag) == _json_prompt_block(
             second_input,
             stable_tag,
         )
-    assert _json_prompt_block(first_input, "profile_recent_context") != _json_prompt_block(
-        second_input,
-        "profile_recent_context",
-    )
+    assert _json_prompt_block(first_input, "profile_recent_context") == {}
 
     assert engine.evaluation_profile_prompt_cache_stats()["profile_core"]["hits"] == 1
-    assert engine.evaluation_profile_prompt_cache_stats()["profile_recent_context"]["misses"] == 2
+    assert engine.evaluation_profile_prompt_cache_stats()["profile_recent_context"]["hits"] == 1
+    assert engine.evaluation_profile_prompt_cache_stats()["profile_recent_context"]["misses"] == 1
 
 
 @pytest.mark.asyncio

@@ -125,6 +125,7 @@ byte-identical across calls**. So:
 5. Any prompt that carries the user profile MUST serialize it through a
    named view in `src/openbiliclaw/soul/profile_views.py`
    (`build_profile_summary` / `compact_content_prompt_profile_summary` /
+   `compact_gate_evaluation_profile_summary` /
    `build_query_generation_profile_summary`, or a new view added there) —
    **never hand-roll a profile serializer at the call site**. Views are
    pure, deterministic functions of the effective profile and the portrait

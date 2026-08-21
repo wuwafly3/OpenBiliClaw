@@ -3,9 +3,10 @@
 These pin two standing invariants that no test previously covered:
 
 1. **Portrait boundary** — the free-form ``personality_portrait`` narrative must
-   never leak into a content-pipeline serializer. The three designed dict
+   never leak into a content-pipeline serializer. The designed dict
    serializers (``build_profile_summary`` / ``compact_content_prompt_profile_summary``
-   / ``build_query_generation_profile_summary``) and the string-shaped
+   / ``compact_gate_evaluation_profile_summary`` /
+   ``build_query_generation_profile_summary``) and the string-shaped
    ``OnionProfile.to_llm_context(include_portrait=False)`` fork are all fed a
    sentinel portrait and asserted to exclude it.
 2. **Determinism** — each serializer is a pure function of the profile: two calls
@@ -26,6 +27,7 @@ from openbiliclaw.discovery.strategies._utils import (
     build_profile_summary,
     build_query_generation_profile_summary,
     compact_content_prompt_profile_summary,
+    compact_gate_evaluation_profile_summary,
 )
 from openbiliclaw.soul.profile import (
     AwarenessNote,
@@ -126,6 +128,13 @@ def test_compact_content_prompt_summary_excludes_portrait() -> None:
     assert _PORTRAIT_SENTINEL not in _canonical(compacted)
 
 
+def test_compact_gate_evaluation_summary_excludes_portrait() -> None:
+    profile = _soul_profile()
+    compacted = compact_gate_evaluation_profile_summary(build_profile_summary(profile))
+    assert _PORTRAIT_SENTINEL not in _canonical(compacted)
+    assert "recent_awareness" not in compacted
+
+
 def test_query_generation_summary_excludes_portrait() -> None:
     profile = _soul_profile()
     assert _PORTRAIT_SENTINEL not in _canonical(build_query_generation_profile_summary(profile))
@@ -151,6 +160,13 @@ def test_compact_content_prompt_summary_is_deterministic() -> None:
     p1, p2 = _soul_profile(), _soul_profile()
     first = compact_content_prompt_profile_summary(build_profile_summary(p1))
     second = compact_content_prompt_profile_summary(build_profile_summary(p2))
+    assert _canonical(first) == _canonical(second)
+
+
+def test_compact_gate_evaluation_summary_is_deterministic() -> None:
+    p1, p2 = _soul_profile(), _soul_profile()
+    first = compact_gate_evaluation_profile_summary(build_profile_summary(p1))
+    second = compact_gate_evaluation_profile_summary(build_profile_summary(p2))
     assert _canonical(first) == _canonical(second)
 
 

@@ -11,7 +11,8 @@ Usage::
         --config E:/otherproject/OpenBiliClaw/config.toml \\
         --db E:/otherproject/OpenBiliClaw/data/openbiliclaw.db \\
         --instance openai-4 \\
-        --limit 90
+        --limit 90 \\
+        --require-snapshot
 
 Only original rows whose ``teacher_model`` is an exact ``provider/model``
 match with the pinned instance are eligible. Different adapters that share
@@ -339,6 +340,36 @@ def resolve_replay_snapshot(
     return snapshot
 
 
+def filter_snapshot_backed_rows(
+    rows: list[dict[str, Any]],
+    database: Database,
+) -> tuple[list[dict[str, Any]], int]:
+    """Keep rows whose digest pair has a verified snapshot.
+
+    Lookups are cached per ``(profile_digest, negative_digest)`` so a later
+    ``--require-snapshot`` sample is drawn from the snapshot-backed pool
+    instead of from the full allowlist (which is still mostly legacy empty
+    digests).
+    """
+
+    cache: dict[tuple[str, str], EvaluationContextSnapshot | None] = {}
+    kept: list[dict[str, Any]] = []
+    dropped = 0
+    for row in rows:
+        key = eval_context_key(row)
+        if key not in cache:
+            cache[key] = resolve_replay_snapshot(
+                database,
+                profile_digest=key[0],
+                negative_digest=key[1],
+            )
+        if cache[key] is None:
+            dropped += 1
+            continue
+        kept.append(row)
+    return kept, dropped
+
+
 def prepare_replay_groups(
     rows: list[dict[str, Any]],
     database: Database,
@@ -594,7 +625,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--require-snapshot",
         action="store_true",
-        help="Skip rows that have no verified evaluation_context_snapshots payload.",
+        help=(
+            "Sample and replay only rows with a verified "
+            "evaluation_context_snapshots payload."
+        ),
     )
     return parser.parse_args(argv)
 
@@ -803,8 +837,15 @@ def _run_probe(
         provider_type=provider_type,
         model=model,
     )
+    sample_pool = eligible
+    if bool(args.require_snapshot):
+        sample_pool, dropped_no_snapshot = filter_snapshot_backed_rows(
+            eligible, database
+        )
+        filter_counts["dropped_no_snapshot"] = dropped_no_snapshot
+        filter_counts["snapshot_backed"] = len(sample_pool)
     sample = stratified_sample(
-        eligible,
+        sample_pool,
         limit=max(1, int(args.limit)),
         seed=int(args.seed),
     )
@@ -823,6 +864,12 @@ def _run_probe(
     print(f"  dropped model         {filter_counts['dropped_model_mismatch']}")
     print(f"  dropped provider      {filter_counts['dropped_provider_mismatch']}")
     print(f"  eligible (exact)      {filter_counts['kept']}")
+    if bool(args.require_snapshot):
+        print(f"  snapshot-backed       {filter_counts.get('snapshot_backed', 0)}")
+        print(
+            "  dropped no-snapshot   "
+            f"{filter_counts.get('dropped_no_snapshot', 0)} (--require-snapshot)"
+        )
     print(f"  sample                {len(sample)} (limit={args.limit} seed={args.seed})")
     platform_counts = Counter(str(row.get("source_platform") or "?") for row in sample)
     print(f"  sample platforms      {dict(platform_counts)}")

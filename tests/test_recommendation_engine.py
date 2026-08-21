@@ -205,6 +205,8 @@ def test_recommendation_profile_summary_compacts_maxed_profile() -> None:
     assert len(summary["core_traits"]) == 20
     assert len(summary["interests"]) == 48
     assert len(summary["interest_domains"]) == 32
+    assert summary["recent_awareness"]
+    assert summary["active_insights"]
 
 
 def test_recommendation_profile_summary_compacts_after_interests_substitution() -> None:

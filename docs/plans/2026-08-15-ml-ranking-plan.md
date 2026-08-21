@@ -1,7 +1,11 @@
 # ML Ranking 实施计划
 
 **Spec:** `docs/plans/2026-08-15-ml-ranking-spec.md`
-**Branch:** `feat/ml-ranking`（worktree `E:\otherproject\OpenBiliClaw-ml-ranking`）
+**2026-08-21 修订:** 阶段 1/2 切分、Wave 1 验收与画像漂移训练合同以
+[`2026-08-21-ml-gate-ranker-separation-spec.md`](./2026-08-21-ml-gate-ranker-separation-spec.md)
+/ [`2026-08-21-ml-gate-ranker-separation-plan.md`](./2026-08-21-ml-gate-ranker-separation-plan.md)
+为准。Gate ≠ ranker；Wave 1 不再把 C1–C7 与 Brier、300 条曝光负样本当作合入门。
+**Branch:** `feat/ml-ranking`
 **规则:** 成本门槛不得覆盖一致性门槛；一致性门槛不得覆盖质量门槛。
 
 ## Wave 0 — 仪器化（阻塞后续全部 Wave）
@@ -26,9 +30,11 @@
    数据集——embedding LRU 缓存对历史候选命中率仅 12%，不可作数据源
    （pairwise 原型实测）。
 4. 冻结 `engagement_label` 定义（spec 附录 A）并实现纯函数 + 单测。
-5. 采集真实使用数据；负样本 ≥ 300 条方可进 Wave 1 训练。
+5. 采集真实使用数据；（曝光, 无互动）负样本 ≥ 300 是 **Wave 2 ranker** 前置，
+   **不**阻塞 Wave 1 gate 训练（分离 spec D3）。
 
-**门:** 曝光行数 > 0；（曝光, 无互动）负样本 ≥ 300。
+**门:** 曝光账本行数 > 0 即可继续仪器化。Ranker 另需（曝光, 无互动）≥ 300 且
+正样本 ≥ 200。
 
 ## Wave 1 — 准入二分类蒸馏（成本项）
 
@@ -57,6 +63,9 @@
    **2026-08-19：** 教师 oracle 初训入口已落地（logistic + OOF isotonic，
    `tags_source=teacher_oracle`）。S1.5 数字是 holdout 测量项，不是合入门槛。
    浅 GBDT 仍待后续切片。
+   **2026-08-20：** 扩池重训 7726 行，OOF AUC 0.794 / 0.70 点 agreement 0.635
+   （对照 8-19 的 2955 行 0.825 / 0.699）。GroupKFold 改走候选
+   `profile_digest`。默认 `relevance_scorer` 仍为 `llm`。
    **2026-08-19：** `scripts/ml_teacher_self_consistency_probe.py` 测同一 pinned
    教师（默认 `openai-4`，精确 `openai/deepseek-v4-flash`）的准入自洽，作为
    agreement 理论天花板；不混 `openai_compatible`。live 90 条
@@ -73,21 +82,23 @@
    **2026-08-19：** 开关与三处装配已落地。`ml` 仍观察性，不跳过评估。
 6. `shadow` 模式：ML 与 LLM 同时判定，分歧写 `ranking_feature_log`，不影响准入。
    **2026-08-19：** 分歧先打隐私安全日志（平台/策略/0-1）；`ranking_feature_log` 表仍待 Wave 0。
-7. `scripts/evaluate_relevance_distillation.py`：算 spec S1.5 六项门槛
-   （AUC / 一致率 / FPR / FNR / Brier / 分平台分层）。
-8. 阈值重标定 **C1–C7 全部 7 个常数**（§3.1）：准入线按 FPR/FNR 权衡选点，
-   delight/通知/tier 取同分位，注释写标定溯源与分位数对齐证据。
+7. `scripts/evaluate_relevance_distillation.py`：按
+   [分离 spec S1.5](./2026-08-21-ml-gate-ranker-separation-spec.md) 报告
+   （一致率 ≥ 0.95 × 快照自洽天花板、FPR/FNR、分组 AUC、分平台）。Brier 只打印。
+8. 阈值重标定 **仅 C1**。C2/C3/C6 留在教师分；C4/C5 留给 Wave 2 ranker。
 9. LLM 保留调用集定义（y=1 候选 + 不确定带 + 校准集）落地为代码常量 + 注释。
-   概率校准（Brier 门槛）用 isotonic——pairwise 原型已验证该形式可用
-   （`docs/plans/2026-08-16-ml-pairwise-probe.md`）。
+   isotonic 仍可进 artifact，服务不确定带，**不是**合入门槛。
+10. 生产训练 `--require-snapshot` + 画像相对特征：见分离 plan Task 2–3。
 
-**门:** S1.5 六项全过（含分平台分层）；`discovery.evaluate_batch` token ≤ 基线 70%。
+**门:** 分离 spec 改写后的 S1.5；`discovery.evaluate_batch` token ≤ 基线 70%。
+默认 `relevance_scorer` 仍为 `llm`，直到相对特征与快照过滤落地。
 
 ## Wave 2 — 学习排序总分
 
 1. `ml/ranker.py`：替换 `PoolCurator.score_candidates` 的线性组合，
    fatigue / monotony 输入统计量保持现有确定性计算。
-2. 训练脚本以 `engagement_label` 为目标（**不是**教师分）。
+2. 训练脚本以 `engagement_label` 为目标（**不是**教师分；默认也不吃
+   `ml_admission_p`）。
 3. 开关 `[recommendation].ranker = "weights" | "shadow" | "ml"`，默认 `weights`。
 4. 评估：label-weighted NDCG@10 + bootstrap 置信区间；
    explore / 跨平台占比分层对照（沿用 `TemporalTopKShadowMetrics` 口径）。
@@ -98,7 +109,8 @@
 
 1. LLM 调用收敛到三种情形（y=1 候选 + 不确定带 + 周期校准集）。
 2. 教师标签持续入训练集；模型按版本重训并留存评估记录。
-3. 漂移告警：校准集 ROC-AUC 或准入线一致率跌破门槛自动回落 `shadow`。
+3. 漂移告警拆分：教师噪声 / 画像条件 / 排序质量；gate 回落 `shadow` 不得关掉
+   ranker。见分离 spec Phase 3。
 
 ## Wave 4 — 文档与发布
 
@@ -113,7 +125,9 @@
   不跳过 LLM、不改 admission。未在 live daemon 打开。
 - **人类正样本约 50 条**（like 16 + favorite 关联部分）→ 低于 Wave 2 门槛 200，
   采集进行中。
-- **教师分对 like/dislike 的 AUC = 0.4513** → Wave 1 只声称成本，不声称质量。
+- **教师分对 like/dislike 的 AUC = 0.4513** → Wave 1 gate 只声称成本，不声称质量。
+- **2026-08-21：** gate 与 ranker 分离。见
+  [`2026-08-21-ml-gate-ranker-separation-spec.md`](./2026-08-21-ml-gate-ranker-separation-spec.md)。
 - **Wave 1 训练集 ≈ 686 行**（教师判定白名单：非零教师分 599 + shadow_audit
   恢复的 cap 置零真阳性 87；S0.3a 溯源已落地），未截断；来源表 30 天滚动保留
   → Wave 0 第 3 步必须先导出固化。

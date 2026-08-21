@@ -58,7 +58,7 @@ from openbiliclaw.discovery.strategies._utils import (
     _CONTENT_PROMPT_DOMAIN_CAP,
     _CONTENT_PROMPT_INTEREST_CAP,
     build_profile_summary,
-    compact_content_prompt_profile_summary,
+    compact_gate_evaluation_profile_summary,
 )
 from openbiliclaw.discovery.style_keys import normalize_style_key
 from openbiliclaw.discovery.tag_channel import TAG_CHANNEL_SOURCE_LLM, parse_tag_channel_payload
@@ -265,7 +265,7 @@ _EVALUATION_CONTEXT_OVERRIDE: contextvars.ContextVar[EvaluationContextSnapshot |
         default=None,
     )
 )
-_EVAL_BATCH_CACHE_VERSION = "content-eval-v6"
+_EVAL_BATCH_CACHE_VERSION = "content-eval-v7"  # gate profile omits recent layer
 _EMBEDDING_PREFILTER_DEFAULT_MODE = "shadow"
 _EMBEDDING_PREFILTER_MODES = {"off", "shadow", "enforce"}
 _DEFAULT_EVALUATION_CANDIDATE_TRANSPORT = "sparse-json"
@@ -275,7 +275,7 @@ _EMBEDDING_PREFILTER_REASON = "embedding 预过滤: 与所有兴趣相似度极�
 _NEGATIVE_EXAMPLES_UNSET = object()
 _EVAL_RECALL_POOL_CAP = 256
 _EVAL_RECALL_MIN_SIMILARITY = 0.45
-compact_evaluation_profile_summary = compact_content_prompt_profile_summary
+compact_evaluation_profile_summary = compact_gate_evaluation_profile_summary
 
 
 @dataclass(frozen=True)
@@ -3420,6 +3420,8 @@ class ContentDiscoveryEngine:
         )
 
     def _evaluation_profile_summary(self, profile: SoulProfile) -> dict[str, object]:
+        """Gate-visible compact profile (no recent awareness/insights/speculations)."""
+
         override = self._bound_evaluation_context()
         if override is not None:
             return dict(override.profile_summary)

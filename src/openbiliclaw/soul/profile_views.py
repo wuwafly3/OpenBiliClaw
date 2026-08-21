@@ -12,7 +12,11 @@ The core public structured views:
 * :func:`build_profile_summary` — canonical structured profile (portrait
   excluded); every source-platform content prompt feeds on this.
 * :func:`compact_content_prompt_profile_summary` — caps a
-  ``build_profile_summary`` dict for high-volume content prompts.
+  ``build_profile_summary`` dict for high-volume content prompts (ranker /
+  recommendation expression still include the recent layer).
+* :func:`compact_gate_evaluation_profile_summary` — same compact caps, but
+  drops ``recent_awareness`` / ``active_insights`` / ``speculative_interests``
+  for discovery gate evaluation.
 * :func:`build_query_generation_profile_summary` — query-trimmed taste shape for
   discovery keyword/domain generation (MMR-diversified, embedding-optional).
 * :func:`build_cognition_profile_view_v1` — uncapped, deterministic cognition
@@ -74,6 +78,11 @@ _RECENT_CONTEXT_VOLATILE_KEYS = {
     "timestamp",
     "updated_at",
 }
+_GATE_EVAL_EXCLUDED_RECENT_KEYS = (
+    "recent_awareness",
+    "active_insights",
+    "speculative_interests",
+)
 
 
 def normalize_match_text(value: str) -> str:
@@ -848,10 +857,10 @@ def compact_content_prompt_profile_summary(
 ) -> dict[str, object]:
     """Return a smaller profile summary for high-volume content prompts.
 
-    Discovery evaluation, recommendation expression, and pool classification
-    all pay profile context repeatedly. Keep the highest-signal interests plus
-    the newest awareness/insight windows, while preserving hard negatives such
-    as ``disliked_topics`` unchanged.
+    Recommendation expression / pool classification keep the newest
+    awareness/insight/speculation windows. Discovery gate evaluation must use
+    :func:`compact_gate_evaluation_profile_summary` instead, which drops that
+    recent layer. Hard negatives such as ``disliked_topics`` stay uncapped.
     """
 
     compacted = dict(profile_summary)
@@ -881,6 +890,23 @@ def compact_content_prompt_profile_summary(
         profile_summary.get("speculative_interests"),
         _CONTENT_PROMPT_SPECULATION_CAP,
     )
+    return compacted
+
+
+def compact_gate_evaluation_profile_summary(
+    profile_summary: dict[str, object],
+) -> dict[str, object]:
+    """Compact profile for discovery gate evaluation, without the recent layer.
+
+    Session-scale ``recent_awareness`` / ``active_insights`` /
+    ``speculative_interests`` churn the teacher prompt without being stable
+    tags. Ranker and recommendation prompts keep them via
+    :func:`compact_content_prompt_profile_summary`.
+    """
+
+    compacted = compact_content_prompt_profile_summary(profile_summary)
+    for key in _GATE_EVAL_EXCLUDED_RECENT_KEYS:
+        compacted.pop(key, None)
     return compacted
 
 

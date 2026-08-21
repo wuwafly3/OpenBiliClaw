@@ -84,9 +84,13 @@ The 2026-08-19 probe therefore replayed current `soul.json`.
 ### D2. Compact summary churns independently of the onion file
 
 `compact_content_prompt_profile_summary` includes recent awareness / insights
-/ interest ranks. A 2h/12 `profile_digest` churn is mostly that slice, not a
-product reason to freeze the whole soul. The snapshot is the labeling-time
-view, not a product strategy to stop soul updates.
+/ interest ranks. Through 2026-08-20 that slice drove most of the 2h/12
+`profile_digest` churn. From 2026-08-21 the **gate** writer uses
+`compact_gate_evaluation_profile_summary` (same caps, recent keys popped), so
+new snapshots and digests no longer move when only awareness/insights/speculations
+change. Historical snapshot JSON may still contain recent keys; replay those
+bytes as stored. Recommendation / ranker compact is unchanged and still includes
+recent. The snapshot remains the labeling-time view, not a freeze of `soul.json`.
 
 ### D3. Mixed contexts cannot share a batch
 

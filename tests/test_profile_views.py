@@ -58,11 +58,12 @@ from openbiliclaw.soul.profile import (
 _GOLDEN_DIR = Path(__file__).parent / "golden" / "profile_views"
 _SRC_ROOT = Path(__file__).parent.parent / "src" / "openbiliclaw"
 
-# The three serializer names the façade owns. Their ``def`` must live only in
-# ``soul/profile_views.py`` after Task 5.
+# The serializer names the façade owns. Their ``def`` must live only in
+# ``soul/profile_views.py``.
 _SERIALIZER_NAMES = (
     "build_profile_summary",
     "compact_content_prompt_profile_summary",
+    "compact_gate_evaluation_profile_summary",
     "build_query_generation_profile_summary",
 )
 
@@ -384,6 +385,27 @@ def test_utils_reexports_are_the_facade_objects() -> None:
         assert getattr(_utils, name) is getattr(profile_views, name), name
 
 
+def test_compact_gate_evaluation_profile_summary_drops_recent_keeps_tags() -> None:
+    from openbiliclaw.soul.profile_views import (
+        build_profile_summary,
+        compact_content_prompt_profile_summary,
+        compact_gate_evaluation_profile_summary,
+    )
+
+    summary = build_profile_summary(mature_profile())
+    ranked = compact_content_prompt_profile_summary(summary)
+    gate = compact_gate_evaluation_profile_summary(summary)
+
+    assert ranked["recent_awareness"]
+    assert ranked["active_insights"]
+    assert ranked["speculative_interests"]
+    for key in ("recent_awareness", "active_insights", "speculative_interests"):
+        assert key not in gate
+    assert gate["interests"] == ranked["interests"]
+    assert gate["disliked_topics"] == ranked["disliked_topics"]
+    assert gate["style"] == ranked["style"]
+
+
 # ---------------------------------------------------------------------------
 # Structural guard (invariant V1): serializers defined only in profile_views
 # ---------------------------------------------------------------------------
@@ -400,12 +422,12 @@ def _module_defines(path: Path, names: set[str]) -> set[str]:
 
 
 def test_serializers_defined_only_in_profile_views() -> None:
-    """The three serializer ``def``s appear in exactly one file: profile_views."""
+    """The serializer ``def``s appear in exactly one file: profile_views."""
     names = set(_SERIALIZER_NAMES)
     definers: dict[str, list[str]] = {name: [] for name in names}
     for path in _SRC_ROOT.rglob("*.py"):
         for name in _module_defines(path, names):
-            definers[name].append(str(path.relative_to(_SRC_ROOT)))
+            definers[name].append(path.relative_to(_SRC_ROOT).as_posix())
 
     for name, files in definers.items():
         assert files == ["soul/profile_views.py"], f"{name} defined in {files}"
@@ -436,9 +458,9 @@ def test_content_pipeline_imports_from_facade_or_reexport() -> None:
                             import_sources[alias.name] = node.module
             for name in imported:
                 source = import_sources[name]
-                assert source in allowed_import_roots, (
-                    f"{path.relative_to(_SRC_ROOT)} imports {name} from {source}"
-                )
+                assert (
+                    source in allowed_import_roots
+                ), f"{path.relative_to(_SRC_ROOT)} imports {name} from {source}"
 
 
 if __name__ == "__main__":  # pragma: no cover — golden generation helper

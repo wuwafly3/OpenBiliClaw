@@ -250,3 +250,44 @@ def test_prepare_replay_groups_require_snapshot_skips_legacy_and_missing() -> No
     assert live_counts["replay_rows"] == 3
     assert live_replay[1][0] is None
     assert [row["id"] for row in live_replay[1][1]] == [2]
+
+
+def test_filter_snapshot_backed_rows_keeps_verified_digest_pairs() -> None:
+    from openbiliclaw.discovery.eval_context import (
+        EvaluationContextSnapshot,
+        compute_negative_digest,
+        compute_profile_digest,
+    )
+
+    summary = {"interests": [{"name": "吉他", "weight": 0.9}]}
+    snapshot = EvaluationContextSnapshot(
+        profile_digest=compute_profile_digest(summary, []),
+        negative_digest=compute_negative_digest([]),
+        profile_summary=summary,
+        recall_pool=[],
+        negative_examples=[],
+    )
+
+    class _SnapshotDB:
+        def get_evaluation_context_snapshot(self, *, profile_digest: str, negative_digest: str):
+            if profile_digest == snapshot.profile_digest:
+                return snapshot
+            return None
+
+    rows = [
+        {
+            "id": 1,
+            "profile_digest": snapshot.profile_digest,
+            "negative_digest": snapshot.negative_digest,
+        },
+        {"id": 2, "profile_digest": "", "negative_digest": ""},
+        {
+            "id": 3,
+            "profile_digest": snapshot.profile_digest,
+            "negative_digest": snapshot.negative_digest,
+        },
+        {"id": 4, "profile_digest": "missingdigest", "negative_digest": snapshot.negative_digest},
+    ]
+    kept, dropped = probe.filter_snapshot_backed_rows(rows, _SnapshotDB())
+    assert [row["id"] for row in kept] == [1, 3]
+    assert dropped == 2

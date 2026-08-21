@@ -8,7 +8,8 @@ scores themselves are never features.
 Usage::
 
     uv run --extra ml python scripts/train_relevance_model.py \\
-        --db E:/otherproject/OpenBiliClaw/data/openbiliclaw.db
+        --db E:/otherproject/OpenBiliClaw/data/openbiliclaw.db \\
+        --require-profile-digest
 
 Writes a versioned JSON artifact (weights, scaler, isotonic map, OOF
 metrics). Does not change ``[discovery].relevance_scorer``.
@@ -112,7 +113,7 @@ def load_teacher_records(
     existing = table_columns(conn, "discovery_candidates")
     optional = select_or_null(
         existing,
-        ("body_text", "rating_score", "source_rank"),
+        ("body_text", "rating_score", "source_rank", "profile_digest"),
     )
     rows = conn.execute(
         f"""
@@ -142,6 +143,12 @@ def load_teacher_records(
         teacher_score, policy = resolved
         stats[policy] += 1
         strategy = str(row["source_strategy"] or "")
+        candidate_digest = str(row["profile_digest"] or "").strip()
+        audit_digest = (
+            str(entry["profile_digest"] or "").strip()
+            if entry is not None and "profile_digest" in entry
+            else ""
+        )
         record: dict[str, Any] = {
             "candidate_key": str(row["candidate_key"] or ""),
             "teacher_score": float(teacher_score),
@@ -158,11 +165,8 @@ def load_teacher_records(
             "duration_s": float(row["duration"] or 0),
             "rating_score": float(row["rating_score"] or 0),
             "source_rank": float(row["source_rank"] or 0),
-            "profile_digest": (
-                str(entry["profile_digest"] or "")
-                if entry is not None and "profile_digest" in entry
-                else ""
-            ),
+            "candidate_profile_digest": candidate_digest,
+            "profile_digest": candidate_digest or audit_digest,
             **{col: float(row[col] or 0) for col in ENGAGEMENT_COLUMNS},
         }
         if entry is not None and entry["similarity"] is not None:
@@ -171,6 +175,22 @@ def load_teacher_records(
             record["context"] = str(entry["context_class"] or "other")
         records.append(record)
     return records, dict(stats)
+
+
+def filter_records_with_candidate_profile_digest(
+    records: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Keep teacher rows whose ``discovery_candidates.profile_digest`` is set.
+
+    Prefilter-audit digests are ignored: those are not labeling-time snapshots.
+    """
+
+    kept = [
+        record
+        for record in records
+        if str(record.get("candidate_profile_digest") or "").strip()
+    ]
+    return kept, len(records) - len(kept)
 
 
 def encode_teacher_features(
@@ -244,7 +264,11 @@ def dataset_fingerprint(records: list[dict[str, Any]]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def train(records: list[dict[str, Any]]) -> dict[str, Any]:
+def train(
+    records: list[dict[str, Any]],
+    *,
+    decision_threshold: float | None = None,
+) -> dict[str, Any]:
     from sklearn.isotonic import IsotonicRegression
     from sklearn.linear_model import LogisticRegression
     from sklearn.model_selection import GroupKFold, StratifiedKFold
@@ -285,7 +309,12 @@ def train(records: list[dict[str, Any]]) -> dict[str, Any]:
     iso_y = getattr(calibrator, "y_thresholds_", getattr(calibrator, "y_thresholds", None))
     if iso_x is None or iso_y is None:
         raise RuntimeError("IsotonicRegression did not expose threshold arrays")
-    threshold = pick_threshold(y, calibrated)
+    if decision_threshold is None:
+        threshold = pick_threshold(y, calibrated)
+        threshold_policy = "oof_fpr_le_0.10"
+    else:
+        threshold = float(decision_threshold)
+        threshold_policy = "fixed"
     overall = classification_metrics(y, calibrated, threshold)
     at_half = classification_metrics(y, calibrated, 0.5)
     by_platform: dict[str, dict[str, float]] = {}
@@ -320,6 +349,7 @@ def train(records: list[dict[str, Any]]) -> dict[str, Any]:
         "isotonic_y": np.asarray(iso_y, dtype=float).tolist(),
         "isotonic_fit": "oof_logistic_scores",
         "decision_threshold": threshold,
+        "threshold_policy": threshold_policy,
         "oof_metrics": overall,
         "oof_metrics_at_0_5": at_half,
         "oof_metrics_by_platform": by_platform,
@@ -341,10 +371,14 @@ def _print_metrics(payload: dict[str, Any]) -> None:
     )
     print(f"  groups/folds          {payload['n_groups']} / {payload['n_folds']}")
     if payload["n_groups"] == payload["n_rows"]:
-        print("  grouping              per-row (no shared profile_digest on joined audit)")
+        print("  grouping              per-row (no shared profile_digest)")
+    else:
+        print(f"  grouping              {payload['group_split']}")
     print(f"  features              {len(payload['feature_names'])}  {payload['feature_version']}")
     print(f"  tags_source           {payload['tags_source']}")
-    print(f"  threshold             {payload['decision_threshold']:.2f} (OOF, FPR<=0.10 search)")
+    print(f"  row_filter            {payload.get('row_filter', 'all_teacher')}")
+    policy = str(payload.get("threshold_policy") or "oof_fpr_le_0.10")
+    print(f"  threshold             {payload['decision_threshold']:.2f} ({policy})")
     print(f"  AUC                   {overall['auc']:.3f}")
     print(f"  agreement             {overall['agreement']:.3f}")
     print(f"  FPR / FNR             {overall['fpr']:.3f} / {overall['fnr']:.3f}")
@@ -356,7 +390,7 @@ def _print_metrics(payload: dict[str, Any]) -> None:
             f"fpr={at_half['fpr']:.3f} fnr={at_half['fnr']:.3f}"
         )
     print(
-        "  S1.5 gates            "
+        "  S1.5 (info only)      "
         + ", ".join(f"{name}={'yes' if ok else 'no'}" for name, ok in payload["s1_5"].items())
     )
     by_platform = payload.get("oof_metrics_by_platform") or {}
@@ -374,6 +408,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    parser.add_argument(
+        "--require-profile-digest",
+        action="store_true",
+        help=(
+            "Train only on rows with a non-empty discovery_candidates.profile_digest "
+            "(labeling-time stamp). Audit-only digests are excluded."
+        ),
+    )
+    parser.add_argument(
+        "--decision-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Fixed operating point on calibrated OOF scores. Default is the S1.5 "
+            "FPR<=0.10 search. Pass 0.5 to ignore that search."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -393,10 +444,19 @@ def main(argv: list[str] | None = None) -> int:
     records, stats = load_teacher_records(conn)
     conn.close()
     print(f"teacher rows: {len(records)}  provenance={stats}")
+    if bool(args.require_profile_digest):
+        records, dropped = filter_records_with_candidate_profile_digest(records)
+        print(
+            "  require-profile-digest kept "
+            f"{len(records)}  dropped {dropped} (empty candidate digest)"
+        )
     if len(records) < 40:
         print("not enough teacher rows to train")
         return 1
-    payload = train(records)
+    payload = train(records, decision_threshold=args.decision_threshold)
+    payload["row_filter"] = (
+        "candidate_profile_digest" if bool(args.require_profile_digest) else "all_teacher"
+    )
     _print_metrics(payload)
     out = args.out.expanduser().resolve()
     out.parent.mkdir(parents=True, exist_ok=True)

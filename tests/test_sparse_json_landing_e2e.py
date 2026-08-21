@@ -25,7 +25,9 @@ from openbiliclaw.soul.profile import InterestTag, SoulProfile
 from openbiliclaw.storage.database import Database
 
 _V6_PRODUCTION_SYSTEM_SHA256 = "0316ce1690e86c6ee6cbd513e270b80177d451883db7341e4d751d667a9ebdda"
-_V6_PRODUCTION_USER_SHA256 = "48944e86483632062b18f1d6b26655d2ef64ac4855c8f34d92da99d76a3d619f"
+# User golden moved when gate eval dropped the empty recent-layer keys
+# (`{}` vs `recent_awareness/active_insights/speculative_interests: []`).
+_V6_PRODUCTION_USER_SHA256 = "5fdbf93529c95abf34b01654b94cc8498fdd8dc696bc3f454539cee12d81e8cd"
 
 
 def _profile(*, private: bool = False) -> SoulProfile:
@@ -204,7 +206,7 @@ async def test_default_engine_uses_sparse_local_ids_on_cold_and_warm_prompt_path
 
     cache_keys = list(engine._eval_cache_store())  # noqa: SLF001
     assert cache_keys
-    assert all(key.startswith("content-eval-v6:batch:") for key in cache_keys)
+    assert all(key.startswith("content-eval-v7:batch:") for key in cache_keys)
     assert all(key.endswith(":transport:sparse-json") for key in cache_keys)
 
 

@@ -10,16 +10,16 @@
 
 ## The serialization paths
 
-The profile reaches an LLM prompt through a small set of serializers. The three
-content-pipeline serializers now live in `soul/profile_views.py` (Task 5 moved
-them verbatim from `discovery/strategies/_utils.py`, which keeps re-export stubs
-so every legacy import path stays valid):
+The profile reaches an LLM prompt through a small set of serializers. Content-pipeline
+serializers live in `soul/profile_views.py` (`discovery/strategies/_utils.py` keeps
+re-export stubs so every legacy import path stays valid):
 
 | Serializer | Defined at | Shape | Portrait? | Notes |
 | --- | --- | --- | --- | --- |
-| `build_profile_summary` | `soul/profile_views.py:360` (re-export `discovery/strategies/_utils.py`) | dict | **No** | Canonical structured profile; portrait deliberately excluded (`profile_views.py:371-375`). `favorite_up_users` also excluded (`profile_views.py:392`). |
-| `compact_content_prompt_profile_summary` | `soul/profile_views.py:512` (re-export `discovery/strategies/_utils.py`) | dict | **No** | Caps a `build_profile_summary` dict for high-volume content prompts. Aliased as `compact_evaluation_profile_summary` (`discovery/engine.py:102`). Dislike floor preserved (`profile_views.py:46-50`). |
-| `build_query_generation_profile_summary` | `soul/profile_views.py:914` (re-export `discovery/strategies/_utils.py`) | dict | **No** | Query-trimmed taste shape; drops awareness/insights/timestamps. Interests cap 64, domains ≤16. |
+| `build_profile_summary` | `soul/profile_views.py` (re-export `discovery/strategies/_utils.py`) | dict | **No** | Canonical structured profile; portrait deliberately excluded. `favorite_up_users` also excluded. |
+| `compact_content_prompt_profile_summary` | `soul/profile_views.py` (re-export `_utils`) | dict | **No** | Caps a `build_profile_summary` dict for ranker / recommendation expression (20 core / 48 interests / 32×16 domains / 12 recent; dislike floor preserved). |
+| `compact_gate_evaluation_profile_summary` | `soul/profile_views.py` (re-export `_utils`) | dict | **No** | Same compact caps, then drops `recent_awareness` / `active_insights` / `speculative_interests`. Aliased as `compact_evaluation_profile_summary` in `discovery/engine.py`. |
+| `build_query_generation_profile_summary` | `soul/profile_views.py` (re-export `_utils`) | dict | **No** | Query-trimmed taste shape; drops awareness/insights/timestamps. Interests cap 64, domains ≤16. |
 | `build_cognition_profile_view_v1` / `CognitionProfileViewV1` | `soul/profile_views.py` | stable soul + stable preference + volatile cognition | **Yes, when soul is supplied** | Named, uncapped cognition-only projection. Removes storage/init bookkeeping and the duplicate `soul.interest` subtree, filters archived positive interests, preserves negative evidence and unknown semantic fields, and splits recent awareness/active insights from the stable prefix. Awareness/Insight historically received the full soul snapshot, including `personality_portrait`, so compact-v1 deliberately preserves it. Preference does not supply a soul snapshot. |
 | `speculation` (→ `to_llm_context(include_portrait=False)`) | `soul/profile_views.py` (`speculation`); renderer `soul/profile.py:720` (onion) / `:115` (flat) | str | **No** (opted out) | String view for the two speculator prompts. Task 7 collected the former in-line `to_llm_context(include_portrait=False)` fork into a façade view that delegates to the profile's own renderer (zero behaviour change). `include_portrait=True` default still keeps the portrait for eval/persona rendering (not this path). |
 | `chat_core_memory` / `render_core_memory_blocks` | `soul/profile_views.py` (`chat_core_memory`), `memory/manager.py` (`render_core_memory_blocks` / `render_core_memory_prompt`) | `(stable, volatile)` str pair | **Yes** (stable block) | Chat core-memory view. Reads the **effective** profile (AI ⊕ overrides via `_effective_soul_data`, `manager.py`), so manual edits show. `complete_with_core_memory` injects `stable_block` (portrait/identity/preference) into system and `volatile_block` (awareness/insights) ahead of the user turn — awareness churn no longer breaks the cached system prefix (Task 6). `render_core_memory_prompt` kept as the concatenated compat wrapper for non-chat readers. |
@@ -34,9 +34,9 @@ explicit narrow set of transport/projection bookkeeping fields.
 
 | Surface | Trigger cadence | View / serializer | Fields (caps) | Portrait? | LLM? |
 | --- | --- | --- | --- | --- | --- |
-| Recommendation evaluation / expression | Per candidate (discovery + serve) | `compact_content_prompt_profile_summary(build_profile_summary(...))` — `recommendation/engine.py:126-127` | compact (20 core / 48 interests / 32 domains × 16 specifics / 12 recent; dislikes uncapped) | No | Yes |
-| Discovery evaluation | Per candidate batch | `_evaluation_profile_summary` = `compact_evaluation_profile_summary(build_profile_summary(...))` — `discovery/engine.py:1874`; applied `discovery/engine.py:823` | compact | No | Yes |
-| Discovery evaluation digest (cache key) | Per candidate batch | `_evaluation_profile_digest` — `discovery/engine.py:1862`; used `discovery/engine.py:1542`, `:2119` | digest over the compact prompt-visible slice | No | No (cache key) |
+| Recommendation evaluation / expression | Per candidate (discovery + serve) | `compact_content_prompt_profile_summary(build_profile_summary(...))` — `recommendation/engine.py` `_recommendation_profile_summary` | compact **with** recent (20 core / 48 interests / 32 domains × 16 specifics / 12 recent; dislikes uncapped) | No | Yes |
+| Discovery evaluation (gate teacher) | Per candidate batch | `_evaluation_profile_summary` = `compact_gate_evaluation_profile_summary(build_profile_summary(...))` — `discovery/engine.py` | gate compact: same caps, **no** recent layer | No | Yes |
+| Discovery evaluation digest (cache key) | Per candidate batch | `_evaluation_profile_digest` — hashes the gate-visible slice + recall pool | digest over gate compact (recent omitted) | No | No (cache key) |
 | Search keyword generation | Per discovery cycle | `build_query_generation_profile_summary` — `discovery/strategies/search.py:547`, `:550` | query-trimmed | No | Yes |
 | Explore domain generation | Per discovery cycle | `build_query_generation_profile_summary` — `discovery/strategies/explore.py:428` | query-trimmed | No | Yes |
 | Keyword planner | Per planning batch | `build_query_generation_profile_summary` — `runtime/keyword_planner.py:1221` | query-trimmed | No | Yes |
@@ -81,6 +81,7 @@ It remains intentional on these established surfaces:
 
 Every content-pipeline serializer (`build_profile_summary`,
 `compact_content_prompt_profile_summary`,
+`compact_gate_evaluation_profile_summary`,
 `build_query_generation_profile_summary`, the `speculation` view →
 `to_llm_context(include_portrait=False)`) MUST exclude it. Enforced by
 `tests/test_profile_views_guards.py`.

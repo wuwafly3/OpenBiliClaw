@@ -83,3 +83,15 @@ def test_teacher_tag_features_exclude_scores_and_franchise() -> None:
     assert "franchise" not in joined
     assert matrix.shape == (2, len(names))
     assert vocab["topics"]
+
+
+def test_filter_records_with_candidate_profile_digest_ignores_audit_fallback() -> None:
+    kept, dropped = train_module.filter_records_with_candidate_profile_digest(
+        [
+            _record(candidate_key="k1", candidate_profile_digest="abc", profile_digest="abc"),
+            _record(candidate_key="k2", candidate_profile_digest="", profile_digest="audit"),
+            _record(candidate_key="k3", candidate_profile_digest="  ", profile_digest="xyz"),
+        ]
+    )
+    assert [row["candidate_key"] for row in kept] == ["k1"]
+    assert dropped == 2

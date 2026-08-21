@@ -36,6 +36,9 @@ from openbiliclaw.soul.profile_views import (
     compact_content_prompt_profile_summary as compact_content_prompt_profile_summary,
 )
 from openbiliclaw.soul.profile_views import (
+    compact_gate_evaluation_profile_summary as compact_gate_evaluation_profile_summary,
+)
+from openbiliclaw.soul.profile_views import (
     normalize_match_text as normalize_match_text,
 )
 from openbiliclaw.soul.profile_views import (

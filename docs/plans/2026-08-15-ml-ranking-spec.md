@@ -1,7 +1,11 @@
 # ML Ranking Spec — LLM 蒸馏与学习排序
 
 **Created:** 2026-08-15
-**Status:** draft; 阶段 0 为其余阶段的硬前置
+**Status:** draft; 阶段 0 为其余阶段的硬前置。
+**2026-08-21 修订：** 阶段 1/2 的职责切分、S1.5 / S1.6 验收与画像漂移训练合同
+以 [`2026-08-21-ml-gate-ranker-separation-spec.md`](./2026-08-21-ml-gate-ranker-separation-spec.md)
+为准。下文 S1.5 Brier 合入门槛、S1.6「C1–C7 全部重标定」、以及「gate 概率填
+curator / MMR / delight」作废。
 **Branch:** `feat/ml-ranking`
 **Scope:** `discovery/engine.py` 评估打分、`recommendation/curator.py` 总分、
 `recommendation/engine.py` 排序键、admission / delight 阈值标定、曝光与特征日志、
@@ -41,9 +45,13 @@
 四者里**三个是阈值判定，只有一个用到连续序**。这决定了阶段 1 的建模形态：
 relevance 在管线中的实际角色是准入门，不是精排分（§2.7 给出经验证据）。
 
-因此**换打分器等于同时动四处语义**。CLAUDE.md 硬规则 #3（阈值标定溯源）
-要求 provider/model 更换后重开标定；ML 替换是更彻底的 scorer 更换，
-与分数耦合的常数（§3.1 C1–C7）必须重新标定，不能沿用。
+**2026-08-21：** 四处语义不再由同一个 ML 输出承担。Gate 只替换「入池硬门槛」
+的判定（C1）；delight / 通知 / 池内 tier（C2/C3/C6）继续用已入池条目的教师
+`relevance_score`；curator / MMR（C4/C5）留给阶段 2 ranker。见
+[分离 spec](./2026-08-21-ml-gate-ranker-separation-spec.md)。
+
+因此**换打分器不再等于同时动四处语义**。CLAUDE.md 硬规则 #3 仍要求每个被
+替换的常数单独标定；阶段 1 只重开 C1。
 
 ### 2.2 教师标签可用量
 
@@ -162,7 +170,9 @@ rejected_franchise_quota n=  8  range=[0.60, 0.90]  avg=0.802
 | C6 | 池内重排 tier 边界 | `raw_score < 0.92` | `discovery/engine.py:4111` |
 | C7 | embedding 预过滤线 | 相似度 `< 0.2`（模式默认 `shadow`，当前不拦） | `discovery/engine.py:175, 171` |
 
-C1–C7 是 S1.6 重标定的**完整清单**。任何一项沿用旧数值即视为未完成阶段 1。
+C1–C7 曾是 S1.6 的完整清单。**2026-08-21：** 阶段 1 只标定 C1；C2/C3/C6 留在
+教师分尺度；C4/C5 随阶段 2；C7 可在 gate 上线后退役。沿用未替换常数不是阶段 1
+失败。
 
 ### 3.2 结构规则（与分数无关，ML 不动）
 
@@ -187,7 +197,8 @@ C1–C7 是 S1.6 重标定的**完整清单**。任何一项沿用旧数值即�
 | 6 HTTP | 首屏补货地板 | 少于 `10` 条触发 serve | `api/app.py:456` |
 | — | 跨平台 bonus 归一 | 零为固定点分段归一 | `_normalize_bonus_per_platform` |
 
-模型分数进入的位置**仅限**：`relevance_score`（阶段 1）与 curator 总分（阶段 2）。
+模型分数进入的位置**仅限**：gate 的内存字段 `ml_admission_*`（阶段 1，不写
+`relevance_score`）与 curator 总分（阶段 2 ranker）。`relevance_score` 仍是教师分。
 
 **标签构造的陷阱**：第 3 层是 6 个并列判定，不是一个。
 `rejected_franchise_quota`（8 行，均值 0.802）与 `rejected_cache_admission`
@@ -250,10 +261,10 @@ S0.3a 溯源白名单的 `llm_score_raw`），导出即冻结，不做二次打�
 
 ### 阶段 1 — 准入二分类蒸馏（成本项）
 
-阶段 1 的目标不是复现连续分，而是复现**准入决策**：给定候选，判断
-LLM 是否会让它过线。理由见 §2.7 —— relevance 在管线里的实际角色是准入门
-（§2.1 四重身份里三个是阈值），且连续分 41% 集中在 5 个档位上、
-与用户偏好 AUC 0.4513。
+阶段 1 的目标不是复现连续分，而是复现**准入决策**：给定
+**(候选, 该次 compact 画像+负例)**，判断 LLM 是否会让它过线。理由见 §2.7
+与 [分离 spec](./2026-08-21-ml-gate-ranker-separation-spec.md)。Gate 不兼任
+精排；生产训练只接受验证快照行。
 
 **S1.1 标签定义（冻结）**
 
@@ -277,8 +288,9 @@ y = 0  otherwise
   `cached` 330 / `rejected_low_score`（非零部分）248 / 结构性拒绝 21 /
   恢复行 87。`content_cache` 的 1810 行全部 `y=1`（0.60 截断），
   **只可作正样本补充，不可单独构成训练集**。
-- 按 `profile_digest` 分组切分留出集，同一画像版本的行不得跨越 train/holdout
-  边界（§2.6 画像 2 小时内漂移 12 次）。
+- 按 `(profile_digest, negative_digest)` 分组切分留出集；生产 artifact 要求
+  快照 `digests_match()`（§2.6；分离 spec invariant 4）。空 digest 历史行不得
+  混入生产训练。
 
 **S1.2** 特征集只用评估时刻已有、零额外网络成本的量：
 profile↔候选文本余弦（含 max/mean 与可用性掩码）、profile↔封面余弦（多模态开启时）、
@@ -321,35 +333,29 @@ local-first 桌面分发不接受为推理引入训练框架（纯 numpy 前向/
 可行性基线（2026-08-16 实测，同特征集）：logistic AUC 0.724±0.066
 （profile_digest 分组切分）/ 0.799±0.028（分层切分），Brier 0.206——
 当前特征集距 S1.5 门槛有结构性差距，瓶颈在特征表达力而非建模形态
-（pairwise 原型：教师批内排序复现上限 ρ≈0.46）。**文本向量投影与
-廉价标签通道（S1.2a）落地并实测逼近门槛前，不得离开 `shadow`**。
+（pairwise 原型：教师批内排序复现上限 ρ≈0.46）。**文本向量投影、廉价标签通道
+（S1.2a）、验证快照训练与画像相对特征落地并实测逼近门槛前，不得离开
+`shadow`**（分离 spec Phase 1）。
 
 **S1.5 二分类门槛**（`shadow` 转 `ml` 的硬条件，全部满足才可切）：
 
 | 指标 | 门槛 | 说明 |
 | --- | --- | --- |
-| ROC-AUC | ≥ 0.80 | 留出集，按画像版本分组切分 |
-| 准入线一致率 | ≥ 0.90 | ML 判定与 LLM 判定相同的行占比 |
+| ROC-AUC | ≥ 0.80 | 留出集，按 `(profile_digest, negative_digest)` 分组切分 |
+| 准入线一致率 | ≥ 0.95 × 快照自洽 agreement | **2026-08-21：** 绝对 0.90 作废。2026-08-20 天花板 0.756 → 门槛 0.718；holdout n≥100。见分离 spec S1.5 |
 | 假准入率（FPR） | ≤ 0.10 | LLM 会拒、ML 放行 —— 直接污染池 |
 | 假拒率（FNR） | ≤ 0.15 | LLM 会收、ML 拦掉 —— 供给损失，比 FPR 可容忍 |
-| 校准 | Brier ≤ 0.18 | 概率输出要能当分数用于 C4 / C5 / C6 |
-| 分平台分层 | 各自达标 | bilibili / xiaohongshu / bangumi 分别满足上述全部 |
+| 校准 | Brier 为测量项 | **2026-08-21：** 不再为 C4/C5/C6 合入。只服务不确定带宽度 |
+| 分平台分层 | 各自达到一致率与 FPR/FNR | AUC 可作测量 |
 
 FPR 比 FNR 收得更紧，因为假准入把坏内容推到用户面前，假拒只是少几条供给
 （补货机制会补上）。分层是硬要求：全局达标而 xhs 崩掉不算通过。
 
-**S1.6 阈值重标定**：§3.1 的 **C1–C7 共 7 个常数**必须在 ML 输出尺度上
-重新标定，逐项在代码注释里写标定过程与结论（硬规则 #3），
-并给出与旧分位数对齐的映射证据。二分类模型输出概率，因此：
-
-- C1（准入线）直接由分类决策阈给出，按 S1.5 的 FPR/FNR 权衡选点；
-- C2 / C3 / C6（delight 0.75 / 通知 0.82 / tier 0.92）在旧分数上是**分位点**，
-  重标定即取 ML 概率上的同分位；
-- C4 / C5（curator 权重 0.30、MMR α/β）在阶段 2 会被重训，
-  阶段 1 只需保证换尺度后 top-25 Jaccard ≥ 0.80（与旧排序等价）；
-- C7（预过滤 0.2）若二分类模型上线即可退役 —— 它是同一职责的弱版本。
-
-任何一项沿用旧数值即视为阶段 1 未完成。
+**S1.6 阈值重标定（2026-08-21 收窄）：** 阶段 1 只重开 **C1**。决策阈按 S1.5
+的 FPR/FNR 权衡选择，注释写标定（硬规则 #3）。C2 / C3 / C6 继续用已入池
+教师 `relevance_score`，禁止把旧分位映射到 gate 概率。C4 / C5 推迟到阶段 2
+ranker，不做 top-25 Jaccard 对齐。C7 若 gate 上线可退役。详见
+[分离 spec](./2026-08-21-ml-gate-ranker-separation-spec.md)。
 
 **S1.7** 失败回退：ML 推理异常、artifact 缺失 / 版本不匹配、特征缺失超阈 ——
 一律 fail-open 回落 LLM 路径并 WARNING，绝不静默给默认判定
@@ -368,8 +374,9 @@ pairwise 原型）说明准入线邻域的教师判定本身带噪，不确定�
 的标定要以此为依据而非拍脑袋。
 
 **验收**：`discovery.evaluate_batch` token 降到基线的 ≤70%（对应上述理论上界的
-保守取值，非 ≤30% —— 结构化标注调用无法省去）；S1.5 六项门槛全过（含分层）；
-C1–C7 全部重标定且有注释溯源；`openbiliclaw cost --by caller` 可见变化。
+保守取值，非 ≤30% —— 结构化标注调用无法省去）；S1.5 按分离 spec 改写后的
+门槛全过（含分平台 FPR/FNR）；**仅 C1** 重标定且有注释溯源；
+`openbiliclaw cost --by caller` 可见变化。
 
 ### 阶段 2 — 学习排序总分（质量项，依赖阶段 0 数据）
 
@@ -379,6 +386,7 @@ C1–C7 全部重标定且有注释溯源；`openbiliclaw cost --by caller` 可�
 `ScoringWeights` 五项（relevance / freshness / topic_fatigue /
 source_monotony / serendipity）从手工常数变为学习到的贡献，
 但 fatigue / monotony 的**输入统计量**保持现有确定性计算。
+**2026-08-21：** 默认不把 `ml_admission_p` 或教师分当 ranker 主特征。
 
 **S2.3** 门控 `[recommendation].ranker = "weights" | "shadow" | "ml"`，默认 `weights`。
 
@@ -397,8 +405,9 @@ source_monotony / serendipity）从手工常数变为学习到的贡献，
 
 **S3.2** 教师标签持续写入训练集，模型按版本重训并留存评估记录。
 
-**S3.3** 漂移告警：校准集上 ROC-AUC 或准入线一致率跌破 S1.5 门槛即自动回落
-`shadow`。
+**S3.3** 漂移告警（2026-08-21 拆分）：教师采样噪声 / 画像条件漂移 / 排序质量
+分开处理。校准集一致率跌破 S1.5 只回落 **gate** 的 `shadow`，不关 ranker。
+详见分离 spec Phase 3。
 
 ## 5. 风险与对策
 
@@ -409,8 +418,8 @@ source_monotony / serendipity）从手工常数变为学习到的贡献，
 | 用 `status` 打标引入假负样本 | S1.1 强制用 `relevance_score >= 阈值` 计算标签 |
 | explore 行按 0.60 打标 | S1.1 按行取 `effective_admission_threshold`（0.58） |
 | LLM 输出字段当特征（标签泄漏） | S1.2 显式禁 `topic_group` / `style_key` / `franchise_key` / `temporal_*` |
-| 画像高频漂移（2h 内 12 个 digest） | 特征用相对量（余弦 / rank）；留出集按 `profile_digest` 分组切分 |
-| 七个阈值语义随 scorer 漂移 | S1.6 强制重标定 C1–C7 + 注释溯源（硬规则 #3） |
+| 画像高频漂移（2h 内 12 个 digest） | **2026-08-21：** 生产 gate 只训验证快照行；特征相对 t0/live compact+负例；留出按 digest 对切分。见分离 spec D2 / invariant 4 |
+| 七个阈值语义随 scorer 漂移 | 阶段 1 只标定 C1；其余常数不随 gate 换尺度 |
 | 误以为能省下全部评估调用 | S1.8：结构化标注仍需 LLM，验收改为 ≤70% 而非 ≤30% |
 | 为推理引入重依赖 | 运行时纯 numpy；训练进 `[ml]` extra |
 | 空 / 失败模型结果被缓存 | 沿用硬规则 #2：任何模型产出写库前校验，非法值不落盘 |
