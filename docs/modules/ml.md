@@ -26,7 +26,7 @@ S1.5 一致率改为 0.95 × 快照自洽天花板（2026-08-20：0.756 → 0.71
 | 评估上下文快照 | ✅ | `discovery_candidates.profile_digest` / `negative_digest` + `evaluation_context_snapshots`；新教师标签可按打标时刻 prompt 回放 |
 | Gate 评估不含 recent | ✅ | 教师 / digest 走 `compact_gate_evaluation_profile_summary`；recent 只留给推荐 compact / 未来 ranker |
 | 旧合同重打标 | ✅ | `scripts/ml_gate_contract_relabel.py`：把含 recent / 壳标题的快照改写成新合同，用 pinned `openai-4` 重评。输出 JSONL（old/new 分数并列）。不 UPDATE 候选表。2026-08-24：918 行 / 17 组 / ¥29.26；新 y 504/414，相对旧标签翻转 29.4%。训练读 JSONL，不要再 join 当前 `discovery_candidates.profile_digest` |
-| 生产训练只收验证快照 | ✅ | `scripts/train_relevance_model.py --require-snapshot`：空 digest / 无快照 / digest 不匹配 / 仍含 recent 的旧合同行不进矩阵，`row_filter=verified_snapshot`。`--relabel-jsonl` 可先覆盖旧合同分数。`--dry-run` 只打印过滤统计。2026-08-24 live：无 JSONL kept 229；加 8-24 JSONL kept 1147。不改 `relevance_scorer` |
+| 生产训练只收验证快照 | ✅ | `scripts/train_relevance_model.py --require-snapshot`：空 digest / 无快照 / digest 不匹配 / 仍含 recent 的旧合同行不进矩阵，`row_filter=verified_snapshot`。`--relabel-jsonl` 可先覆盖旧合同分数。`--dry-run` 只打印过滤统计。2026-08-24 live：无 JSONL kept 229；加 8-24 JSONL kept 1147。第一轮拟合见 `admission_teacher_v1_20260824_snapshot.json`（AUC 0.702 / 0.50 点 agr 0.656）。不改 `relevance_scorer` |
 | 学习排序 ranker | ❌ | 独立开关 `[recommendation].ranker`（尚未落地）；不以教师分为 y |
 
 ## 公共 API
