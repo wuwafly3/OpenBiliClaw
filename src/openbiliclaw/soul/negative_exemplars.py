@@ -43,6 +43,14 @@ _DEDUPE_PREFIX_CHARS = 20
 # characters are kept verbatim.
 _DEDUPE_STRIP_PATTERN = re.compile(r"[\s#​]+|[!！?？.。,，~～\-—•·]+")
 
+# Complete website ``document.title`` values. Do not list product names or
+# prefixes that are already contained in a full title: the trailing ASCII
+# site brand (``-bilibili``) is stripped from the fingerprint so
+# ``哔哩哔哩 (゜-゜)つロ 干杯~`` matches the one Bilibili homepage entry.
+# Events are not deleted.
+_SHELL_TITLE_CANONICAL = ("哔哩哔哩 (゜-゜)つロ 干杯~-bilibili",)
+_TRAILING_SITE_BRAND = re.compile(r"[a-z0-9]+$")
+
 
 class EventStore(Protocol):
     def query_events(
@@ -83,7 +91,7 @@ def recent_negative_exemplars(
     scored: list[tuple[float, dict[str, Any]]] = []
     for row in rows:
         title = str(row.get("title") or "").strip()
-        if not title:
+        if not title or is_shell_negative_title(title):
             continue
         age_days = _event_age_days(row, now_ts)
         weight = math.exp(-age_days / half_life_days) if half_life_days > 0 else 0.0
@@ -143,6 +151,37 @@ def _event_age_days(row: dict[str, Any], now: datetime) -> float:
     return max(0.0, delta.total_seconds() / 86400.0)
 
 
+def _fingerprint_title(title: str) -> str:
+    """Lowercase title with the same punctuation/whitespace strip as dedup."""
+
+    return _DEDUPE_STRIP_PATTERN.sub("", title.lower())
+
+
+def _shell_fingerprints_for(canonical: str) -> frozenset[str]:
+    fingerprint = _fingerprint_title(canonical)
+    keys = {fingerprint}
+    without_brand = _TRAILING_SITE_BRAND.sub("", fingerprint)
+    if without_brand and without_brand != fingerprint:
+        keys.add(without_brand)
+    return frozenset(keys)
+
+
+_SHELL_TITLE_FINGERPRINTS = frozenset(
+    key for item in _SHELL_TITLE_CANONICAL for key in _shell_fingerprints_for(item)
+)
+
+
+def is_shell_negative_title(title: str) -> bool:
+    """True when *title* is page chrome, not a content title.
+
+    Used by :func:`recent_negative_exemplars` so teacher ``<negative_examples>``
+    do not learn site tabs. Does not mutate stored events.
+    """
+
+    fingerprint = _fingerprint_title(title)
+    return bool(fingerprint) and fingerprint in _SHELL_TITLE_FINGERPRINTS
+
+
 def _truncate_title(title: str) -> str:
     if len(title) <= TITLE_MAX_CHARS:
         return title
@@ -151,6 +190,4 @@ def _truncate_title(title: str) -> str:
 
 def _normalize_prefix(title: str) -> str:
     """Compute a dedup key. Strips whitespace, hashtags, punctuation."""
-    lowered = title.lower()
-    stripped = _DEDUPE_STRIP_PATTERN.sub("", lowered)
-    return stripped[:_DEDUPE_PREFIX_CHARS]
+    return _fingerprint_title(title)[:_DEDUPE_PREFIX_CHARS]

@@ -11,7 +11,7 @@
 
 当前特征版本 `admission-teacher-tags-v1`：确定性互动 / 平台 / 策略特征 + **廉价通道** `tag_channel_*`（`topic_group` / `style_key` / `temporal_class`）。教师 `topic_group` / `style_key` / `temporal_*` / `franchise_key` / 分数不得作为运行时特征。默认 artifact 为 `data/ml_artifacts/admission_teacher_v1.json`（`tags_source=teacher_oracle`，`row_filter=candidate_profile_digest`）。2026-08-20 快照子集 870 行、阈值 0.50：OOF AUC 0.741、agreement 0.700。`relevance_scorer` 默认仍为 `llm`。
 
-生产 artifact 的下一步合同（尚未改训练入口）：只训 `evaluation_context_snapshots` 校验通过的行，并补画像相对特征；S1.5 一致率改为 0.95 × 快照自洽天花板（2026-08-20：0.756 → 0.718），Brier 不是合入门槛。Gate 教师画像从 2026-08-21 起不含 recent 层；旧快照若仍含 `recent_awareness` 等键，属另一套教师合同，不得与新切片混训成同一生产 artifact。
+生产 artifact 的下一步合同（尚未改训练入口）：只训 `evaluation_context_snapshots` 校验通过的行，并补画像相对特征；S1.5 一致率改为 0.95 × 快照自洽天花板（2026-08-20：0.756 → 0.718），Brier 不是合入门槛。Gate 教师画像从 2026-08-21 起不含 recent 层；旧快照若仍含 `recent_awareness` 等键，属另一套教师合同，不得与新切片混训成同一生产 artifact。8-20 旧合同行可通过 `scripts/ml_gate_contract_relabel.py` 去 recent / 丢壳标题后重打标，新分写入 JSONL，**不**覆盖 `discovery_candidates` 旧分。
 
 ## 实现功能
 
@@ -25,6 +25,7 @@
 | 教师自洽天花板 | 🧪 | `scripts/ml_teacher_self_consistency_probe.py`：同一 pinned 实例复测准入标签；只接受精确 `provider/model`，不混 adapter。有快照则按 digest 分组回放 labeling-time compact 画像。2026-08-20 快照回放 agreement **0.756** |
 | 评估上下文快照 | ✅ | `discovery_candidates.profile_digest` / `negative_digest` + `evaluation_context_snapshots`；新教师标签可按打标时刻 prompt 回放 |
 | Gate 评估不含 recent | ✅ | 教师 / digest 走 `compact_gate_evaluation_profile_summary`；recent 只留给推荐 compact / 未来 ranker |
+| 旧合同重打标 | 🧪 | `scripts/ml_gate_contract_relabel.py`：把含 recent / 壳标题的快照改写成新合同，用 pinned `openai-4` 重评。输出 JSONL（old/new 分数并列）。不 UPDATE 候选表。`--dry-run` 先报组数 |
 | 学习排序 ranker | ❌ | 独立开关 `[recommendation].ranker`（尚未落地）；不以教师分为 y |
 
 ## 公共 API
