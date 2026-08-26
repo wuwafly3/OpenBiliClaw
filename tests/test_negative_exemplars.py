@@ -11,7 +11,15 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any
 
-from openbiliclaw.soul.negative_exemplars import recent_negative_exemplars
+from openbiliclaw.discovery.eval_context import compute_negative_digest
+from openbiliclaw.soul.negative_exemplars import (
+    is_shell_negative_title,
+    recent_negative_exemplars,
+)
+
+_BILI_HOME = "哔哩哔哩 (゜-゜)つロ 干杯~-bilibili"
+_BILI_HOME_PREFIX = "哔哩哔哩 (゜-゜)つロ 干杯~"
+_CONTENT_TITLE = "保姆级教程一期通关"
 
 
 class _StubEventStore:
@@ -149,3 +157,67 @@ def test_helper_requests_negative_modes_from_event_store() -> None:
     recent_negative_exemplars(store)
     assert store.calls, "helper should call query_events"
     assert store.calls[0]["satisfaction_modes"] == frozenset({"negative"})
+
+
+def test_page_shell_titles_are_dropped_from_exemplars() -> None:
+    """Homepage / SPA tab titles are collection noise, not rhetoric negatives."""
+    now = datetime(2026, 5, 16, 12, 0, 0)
+    events = [
+        _row(
+            idx=1,
+            title=_BILI_HOME,
+            reason="explicit_negative",
+            age_days=0,
+            now=now,
+        ),
+        _row(
+            idx=2,
+            title=_BILI_HOME_PREFIX,
+            reason="explicit_negative",
+            age_days=0,
+            now=now,
+        ),
+        _row(
+            idx=3,
+            title=_CONTENT_TITLE,
+            reason="explicit_negative",
+            age_days=1,
+            now=now,
+        ),
+        _row(idx=4, title="ChatGLM 深度评测", reason="quick_exit", age_days=2, now=now),
+        _row(idx=5, title="ChatGLM", reason="explicit_negative", age_days=3, now=now),
+    ]
+    store = _StubEventStore(events)
+    out = recent_negative_exemplars(store, now=now)
+    titles = [r["title"] for r in out]
+
+    assert _BILI_HOME not in titles
+    assert _BILI_HOME_PREFIX not in titles
+    assert _CONTENT_TITLE in titles
+    assert "ChatGLM 深度评测" in titles
+    assert "ChatGLM" in titles
+    assert len(out) == 3
+    stored_titles = [row["title"] for row in store._events]
+    assert _BILI_HOME in stored_titles
+    assert _BILI_HOME_PREFIX in stored_titles
+
+    filtered_digest = compute_negative_digest(out)
+    unfiltered_digest = compute_negative_digest(
+        [
+            {"title": _BILI_HOME, "reason": "explicit_negative", "age_days": 0},
+            {"title": _BILI_HOME_PREFIX, "reason": "explicit_negative", "age_days": 0},
+            {"title": _CONTENT_TITLE, "reason": "explicit_negative", "age_days": 1},
+            {"title": "ChatGLM 深度评测", "reason": "quick_exit", "age_days": 2},
+            {"title": "ChatGLM", "reason": "explicit_negative", "age_days": 3},
+        ]
+    )
+    assert filtered_digest != unfiltered_digest
+
+
+def test_shell_title_fingerprint_ignores_punctuation_noise() -> None:
+    assert is_shell_negative_title(_BILI_HOME)
+    assert is_shell_negative_title(_BILI_HOME_PREFIX)
+    assert not is_shell_negative_title("哔哩哔哩")
+    assert not is_shell_negative_title("ChatGLM")
+    assert not is_shell_negative_title("ChatGLM 深度评测")
+    assert not is_shell_negative_title(_CONTENT_TITLE)

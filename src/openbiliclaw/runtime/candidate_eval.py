@@ -123,6 +123,7 @@ class CandidateEvalCoordinator:
         self._wake_event = asyncio.Event()
         self._generation = 0
         self._workers: dict[asyncio.Task[Any], Any] = {}
+        self._tick_freeze_task: asyncio.Task[tuple[Any, Any]] | None = None
         self._supply_task: asyncio.Task[Any] | None = None
         self._post_commit_task: asyncio.Task[Any] | None = None
         self._post_commit_requested = False
@@ -283,6 +284,7 @@ class CandidateEvalCoordinator:
         )
 
     def _fill_open_slots(self) -> float | None:
+        tick_freeze: asyncio.Task[tuple[Any, Any]] | None = None
         while not self._stopping and len(self._workers) < self.worker_count:
             snapshot = self._snapshot()
             if self._projected_inventory(snapshot) >= snapshot.target or snapshot.pending_eval <= 0:
@@ -297,18 +299,73 @@ class CandidateEvalCoordinator:
                 if callable(ready_in):
                     return max(0.0, float(ready_in(limit=self.batch_size)))
                 return None
+            if tick_freeze is None:
+                tick_freeze = self._start_tick_evaluation_freeze()
             task = asyncio.create_task(
-                self._evaluate_worker(claim),
+                self._evaluate_worker(claim, tick_freeze),
                 name=f"candidate_eval:{claim.token[:8]}",
             )
             self._workers[task] = claim
         return None
 
-    async def _evaluate_worker(self, claim: Any) -> Any:
-        profile = self.profile_provider()
-        if inspect.isawaitable(profile):
-            profile = await profile
-        return await self.pipeline.evaluate_claim(claim, profile)
+    def _start_tick_evaluation_freeze(self) -> asyncio.Task[tuple[Any, Any]]:
+        """Load one profile + eval snapshot for every worker spawned in this fill."""
+
+        async def load() -> tuple[Any, Any]:
+            profile = self.profile_provider()
+            if inspect.isawaitable(profile):
+                profile = await profile
+            snapshot = self._capture_tick_evaluation_snapshot(profile)
+            return profile, snapshot
+
+        freeze = asyncio.create_task(load(), name="candidate_eval:tick_snapshot")
+        self._tick_freeze_task = freeze
+        return freeze
+
+    def _capture_tick_evaluation_snapshot(self, profile: Any) -> Any:
+        engine = getattr(self.pipeline, "discovery_engine", None)
+        capture = getattr(engine, "capture_live_evaluation_context", None)
+        if not callable(capture) or profile is None:
+            return None
+        try:
+            return capture(profile)
+        except Exception:
+            logger.debug("candidate eval tick snapshot capture failed", exc_info=True)
+            return None
+
+    async def _evaluate_worker(
+        self,
+        claim: Any,
+        tick_freeze: asyncio.Task[tuple[Any, Any]] | None = None,
+    ) -> Any:
+        if tick_freeze is None:
+            profile = self.profile_provider()
+            if inspect.isawaitable(profile):
+                profile = await profile
+            snapshot = self._capture_tick_evaluation_snapshot(profile)
+        else:
+            profile, snapshot = await tick_freeze
+        engine, token = self._install_tick_evaluation_snapshot(profile, snapshot)
+        try:
+            return await self.pipeline.evaluate_claim(claim, profile)
+        finally:
+            unbind = getattr(engine, "_unbind_evaluation_context", None)
+            if callable(unbind):
+                unbind(token)
+
+    def _install_tick_evaluation_snapshot(self, profile: Any, snapshot: Any) -> tuple[Any, Any]:
+        if snapshot is None:
+            return None, None
+        engine = getattr(self.pipeline, "discovery_engine", None)
+        bind = getattr(engine, "_bind_evaluation_context", None)
+        if not callable(bind):
+            return None, None
+        try:
+            _frozen, token = bind(profile, snapshot=snapshot)
+        except Exception:
+            logger.debug("candidate eval tick snapshot bind failed", exc_info=True)
+            return engine, None
+        return engine, token
 
     def _run_pre_admit_hook(self) -> None:
         """Run the controller's per-tick share maintenance before admission.
@@ -573,6 +630,11 @@ class CandidateEvalCoordinator:
                 await asyncio.gather(*(task for task, _claim in entries), return_exceptions=True)
             for _task, claim in entries:
                 self._release_once(claim, reason="coordinator stopping")
+            freeze = self._tick_freeze_task
+            self._tick_freeze_task = None
+            if freeze is not None and not freeze.done():
+                freeze.cancel()
+                await asyncio.gather(freeze, return_exceptions=True)
 
     def _release_once(self, claim: Any, *, reason: str) -> None:
         token = str(getattr(claim, "token", ""))

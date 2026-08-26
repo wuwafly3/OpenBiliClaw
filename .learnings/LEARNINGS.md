@@ -26,3 +26,46 @@ Ship writer-path instrumentation on the checkout that actually runs `serve-api`.
 - Source: user_feedback
 - Related Files: src/openbiliclaw/discovery/eval_context.py, scripts/ml_teacher_self_consistency_probe.py
 - Tags: worktree, teacher-labels, eval-context-snapshot
+
+## [LRN-20260821-001] insight
+
+**Logged**: 2026-08-21T20:01:00+08:00
+**Priority**: high
+**Status**: resolved
+**Area**: discovery
+
+### Summary
+The 13:07–13:11 awareness-window flip-flop was concurrent eval vs mid-write, not the 12h cognition beat. Dropping recent from the gate closed that digest hole; each candidate-eval worker still reloads `get_profile()`, so INTEREST/negatives can still split one drain tick.
+
+### Details
+`CandidateEvalLoop._evaluate_worker` calls `profile_provider()` per claim. ContextVar freeze is per `evaluate_content_batch`, not per tick. Cognition `soul_layer.data.clear(); save()` has no reader lock.
+
+### Suggested Action
+Implemented 8-21 spec D5 / plan Task 7: `_fill_open_slots` freezes one `EvaluationContextSnapshot` for every worker in that fill. Next fill may load a new profile. Soul-layer reader lock is still out of scope.
+
+### Metadata
+- Source: user_feedback
+- Related Files: src/openbiliclaw/runtime/candidate_eval.py, src/openbiliclaw/discovery/engine.py, src/openbiliclaw/soul/cognition_cycle.py
+- Tags: eval-context-snapshot, concurrency, profile-drift
+
+## [LRN-20260821-002] correction
+
+**Logged**: 2026-08-21T20:01:00+08:00
+**Priority**: medium
+**Status**: resolved
+**Area**: soul
+
+### Summary
+Default tab titles such as `哔哩哔哩 (゜-゜)つロ 干杯~-bilibili` in teacher negatives are collection noise and must be dropped from the exemplar list. List only complete website titles; do not denylist product names like `ChatGLM`.
+
+### Details
+Extension dislike events use `document.title`. Homepage/shell pages therefore poison `<negative_examples>`. Filter at `recent_negative_exemplars`; keep the event rows.
+
+### Suggested Action
+Implemented 8-21 spec D6 / plan Task 6: complete website titles only; the Bilibili cheers prefix matches by stripping the trailing site brand. `ChatGLM` is not a shell. `negative_digest` follows the filtered list.
+
+### Metadata
+- Source: user_feedback
+- Related Files: src/openbiliclaw/soul/negative_exemplars.py, extension/src/content/bilibili.ts
+- Tags: negative-exemplars, teacher-prompt, noise
+

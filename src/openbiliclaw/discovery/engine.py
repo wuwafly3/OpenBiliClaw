@@ -3443,17 +3443,30 @@ class ContentDiscoveryEngine:
             negative_examples=examples,
         )
 
+    def capture_live_evaluation_context(self, profile: SoulProfile) -> EvaluationContextSnapshot:
+        """Freeze gate-visible profile + negatives without binding this task.
+
+        ``CandidateEvalCoordinator`` captures once per ``_fill_open_slots`` so
+        concurrent claim workers share one digest even if cognition writes
+        between ``get_profile()`` calls.
+        """
+
+        return self._build_live_evaluation_context(profile)
+
     def _bind_evaluation_context(
-        self, profile: SoulProfile
+        self,
+        profile: SoulProfile,
+        *,
+        snapshot: EvaluationContextSnapshot | None = None,
     ) -> tuple[
         EvaluationContextSnapshot, contextvars.Token[EvaluationContextSnapshot | None] | None
     ]:
         existing = self._bound_evaluation_context()
         if existing is not None:
             return existing, None
-        snapshot = self._build_live_evaluation_context(profile)
-        token = _EVALUATION_CONTEXT_OVERRIDE.set(snapshot)
-        return snapshot, token
+        frozen = snapshot if snapshot is not None else self._build_live_evaluation_context(profile)
+        token = _EVALUATION_CONTEXT_OVERRIDE.set(frozen)
+        return frozen, token
 
     def _unbind_evaluation_context(
         self,

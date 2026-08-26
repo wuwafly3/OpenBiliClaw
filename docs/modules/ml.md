@@ -13,6 +13,8 @@
 
 生产 artifact 的下一步合同（尚未改训练入口）：只训 `evaluation_context_snapshots` 校验通过的行，并补画像相对特征；S1.5 一致率改为 0.95 × 快照自洽天花板（2026-08-20：0.756 → 0.718），Brier 不是合入门槛。Gate 教师画像从 2026-08-21 起不含 recent 层；旧快照若仍含 `recent_awareness` 等键，属另一套教师合同，不得与新切片混训成同一生产 artifact。
 
+已锁定、尚未改运行时：explore 去教师（灰区 ∩（投机挂载 ∪ 高多样性））。不得把 gate p 写入 `relevance_score`。
+
 ## 实现功能
 
 | 功能 | 状态 | 说明 |
@@ -26,6 +28,9 @@
 | 评估上下文快照 | ✅ | `discovery_candidates.profile_digest` / `negative_digest` + `evaluation_context_snapshots`；新教师标签可按打标时刻 prompt 回放 |
 | Gate 评估不含 recent | ✅ | 教师 / digest 走 `compact_gate_evaluation_profile_summary`；recent 只留给推荐 compact / 未来 ranker |
 | 学习排序 ranker | ❌ | 独立开关 `[recommendation].ranker`（尚未落地）；不以教师分为 y |
+| Explore 去教师 | ❌ | 合同已锁（分离 spec Phase 4）；运行时仍是教师 0.58 |
+| 负例壳标题过滤 | ✅ | `recent_negative_exemplars` 只按完整网站标题丢掉 B 站首页干杯标题（短标题视为被完整标题包含）；产品名如 `ChatGLM` 不进黑名单。事件行保留，`negative_digest` 跟过滤后的列表走 |
+| 同 tick 冻 snapshot | ✅ | `CandidateEvalCoordinator._fill_open_slots` 对本批 worker 只冻一次 `get_profile()` + 负例；下一 fill 才换尺子。CLI / OpenClaw inline drain 不走该协调器 |
 
 ## 公共 API
 

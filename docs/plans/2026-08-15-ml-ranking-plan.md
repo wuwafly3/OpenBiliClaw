@@ -38,11 +38,13 @@
 
 ## Wave 1 — 准入二分类蒸馏（成本项）
 
-0. **廉价标签通道（S1.2a 已定案，前置）**：tags-only LLM 通道
+0. **廉价标签通道（2026-08-24：移出当前阶段，暂缓）**：tags-only LLM 通道
    （无画像块 / 批 rubric，仅输出 topic/style/temporal）+ 单价实测
    （决定 S1.8 成本模型与验收线）+ 通道输出落库 schema
    （`discovery_candidates` 标注列 + 标注来源标记）。
    依据：tags oracle 消融 Δρ=+0.111（`docs/plans/2026-08-16-ml-tags-ablation-probe.md`）。
+   **2026-08-24：** 现阶段不考虑廉价 tags 通道，本步整体暂缓；已落地代码与
+   列保留但计划不再依赖，Wave 1 不再被本步阻塞。
    可执行切片：[`2026-08-19-ml-wave1-tags-channel-spec.md`](./2026-08-19-ml-wave1-tags-channel-spec.md)
    / [`2026-08-19-ml-wave1-tags-channel-plan.md`](./2026-08-19-ml-wave1-tags-channel-plan.md)。
 1. `ml/features.py`：确定性纯函数特征提取（spec S1.2 特征集，
@@ -85,12 +87,16 @@
 7. `scripts/evaluate_relevance_distillation.py`：按
    [分离 spec S1.5](./2026-08-21-ml-gate-ranker-separation-spec.md) 报告
    （一致率 ≥ 0.95 × 快照自洽天花板、FPR/FNR、分组 AUC、分平台）。Brier 只打印。
+   **2026-08-24：** S1.5 门槛表整体暂停待重订（见分离 spec Phase 1 暂停
+   说明）；评估脚本在重订前只产测量项，不做合入判定。
 8. 阈值重标定 **仅 C1**。C2/C3/C6 留在教师分；C4/C5 留给 Wave 2 ranker。
 9. LLM 保留调用集定义（y=1 候选 + 不确定带 + 校准集）落地为代码常量 + 注释。
    isotonic 仍可进 artifact，服务不确定带，**不是**合入门槛。
 10. 生产训练 `--require-snapshot` + 画像相对特征：见分离 plan Task 2–3。
 
-**门:** 分离 spec 改写后的 S1.5；`discovery.evaluate_batch` token ≤ 基线 70%。
+**门:** 分离 spec 改写后的 S1.5（**2026-08-24：暂停待重订，重订前本门只作
+测量记录**）；`discovery.evaluate_batch` token ≤ 基线 70%（**2026-08-24：
+S1.2a 暂缓后该线待重推导**）。
 默认 `relevance_scorer` 仍为 `llm`，直到相对特征与快照过滤落地。
 
 ## Wave 2 — 学习排序总分

@@ -6,6 +6,12 @@
 以 [`2026-08-21-ml-gate-ranker-separation-spec.md`](./2026-08-21-ml-gate-ranker-separation-spec.md)
 为准。下文 S1.5 Brier 合入门槛、S1.6「C1–C7 全部重标定」、以及「gate 概率填
 curator / MMR / delight」作废。
+**2026-08-24 修订：** ① 廉价 tags 通道（S1.2a）整体移出当前阶段（暂缓）；
+② gate 评估 prompt 无 recent 已核实，新合同 918 行重复对照一致率 0.764、
+near-threshold 带仅 0.60；③ 新增跨教师模型对照任务（外部模型优先）；
+④ S1.5 门槛表整体暂停待重订（0.95×自洽公式与 AUC 选点被证伪；重订方向
+已锁：多数票教师标签基准 + 操作点 FPR/FNR 门槛，AUC 等降为测量项）。
+逐项见分离 spec 顶部 2026-08-24 修订块与其 Phase 1 暂停说明。
 **Branch:** `feat/ml-ranking`
 **Scope:** `discovery/engine.py` 评估打分、`recommendation/curator.py` 总分、
 `recommendation/engine.py` 排序键、admission / delight 阈值标定、曝光与特征日志、
@@ -47,8 +53,9 @@ relevance 在管线中的实际角色是准入门，不是精排分（§2.7 给�
 
 **2026-08-21：** 四处语义不再由同一个 ML 输出承担。Gate 只替换「入池硬门槛」
 的判定（C1）；delight / 通知 / 池内 tier（C2/C3/C6）继续用已入池条目的教师
-`relevance_score`；curator / MMR（C4/C5）留给阶段 2 ranker。见
-[分离 spec](./2026-08-21-ml-gate-ranker-separation-spec.md)。
+`relevance_score`；curator / MMR（C4/C5）留给阶段 2 ranker。Explore 的
+教师 0.58 例外将被 Phase 4「去教师」公式替换（灰区 ∩（投机∪多样）），
+见 [分离 spec](./2026-08-21-ml-gate-ranker-separation-spec.md) Phase 4。
 
 因此**换打分器不再等于同时动四处语义**。CLAUDE.md 硬规则 #3 仍要求每个被
 替换的常数单独标定；阶段 1 只重开 C1。
@@ -306,9 +313,15 @@ profile↔候选文本余弦（含 max/mean 与可用性掩码）、profile↔�
 （多任务原型实验证实辅助头自预测的 tags 只能挽回该信息约 4% 的增量，
 见 `docs/plans/2026-08-16-ml-multitask-probe.md`）；
 教师 tags 的正确获取方式是 S1.2a 的廉价标签通道——那是显式采购的输入，
-不是隐式泄漏。
+不是隐式泄漏。（**2026-08-24：S1.2a 暂缓后，live gate 特征集暂不含任何
+tags**，tags 仅可作为训练侧 oracle 对照并显式标注；D4 的特征表达力缺口
+相应扩大。）
 
-**S1.2a 廉价标签通道（双管线，已定案）**：教师 tags 是主信号——
+**S1.2a 廉价标签通道（2026-08-24：移出当前阶段，暂缓）**：
+**2026-08-24 决定：现阶段不考虑廉价 tags 通道，本节整体暂缓**——已落地的
+通道代码与 `tag_channel_*` 列保留但计划不再依赖；S1.8 成本模型回到无①的
+形态，≤70% 验收线待 S1.5 重订与跨模型教师选定后重推导。以下保留为历史
+记录与未来重开依据。教师 tags 是主信号——
 tags oracle 消融（`scripts/ml_tags_ablation_probe.py`，
 `docs/plans/2026-08-16-ml-tags-ablation-probe.md`）实测 Δρ = +0.111
 （0.604→0.715；AUC 0.799→0.864；xhs ρ +0.210 几乎追平 bilibili），
@@ -333,11 +346,16 @@ local-first 桌面分发不接受为推理引入训练框架（纯 numpy 前向/
 可行性基线（2026-08-16 实测，同特征集）：logistic AUC 0.724±0.066
 （profile_digest 分组切分）/ 0.799±0.028（分层切分），Brier 0.206——
 当前特征集距 S1.5 门槛有结构性差距，瓶颈在特征表达力而非建模形态
-（pairwise 原型：教师批内排序复现上限 ρ≈0.46）。**文本向量投影、廉价标签通道
-（S1.2a）、验证快照训练与画像相对特征落地并实测逼近门槛前，不得离开
-`shadow`**（分离 spec Phase 1）。
+（pairwise 原型：教师批内排序复现上限 ρ≈0.46）。**文本向量投影、
+验证快照训练与画像相对特征落地并实测逼近门槛前，不得离开 `shadow`**
+（分离 spec Phase 1；2026-08-24：S1.2a 暂缓，廉价标签通道不在该清单内，
+且 S1.5 门槛表本身暂停待重订）。
 
 **S1.5 二分类门槛**（`shadow` 转 `ml` 的硬条件，全部满足才可切）：
+**2026-08-24：本表整体暂停、待重订**（0.95×自洽公式与 AUC 选点被
+918 行重复对照证伪；教师两抽互测 FPR 0.256 / FNR 0.220，自身都过不了
+本表）。重订方向与理由见分离 spec Phase 1 暂停说明；重订前不得以本表
+作为合入/拒绝依据。
 
 | 指标 | 门槛 | 说明 |
 | --- | --- | --- |
@@ -361,7 +379,10 @@ ranker，不做 top-25 Jaccard 对齐。C7 若 gate 上线可退役。详见
 一律 fail-open 回落 LLM 路径并 WARNING，绝不静默给默认判定
 （硬规则 #7：可诊断优于"看起来能跑"）。
 
-**S1.8 LLM 保留调用集（S1.2a 定案后的形态）**：ML 替换分数门，
+**S1.8 LLM 保留调用集**：**2026-08-24：S1.2a 暂缓后，下述①廉价标签通道
+一类暂时不存在**。成本模型回到「ML 替换分数门 + 完整评估仅 y=1 + 不确定带/
+校准集」；≤70% 验收线的重推导延后到 S1.5 重订与跨模型教师选定之后。
+以下为 S1.2a 定案时的历史形态。ML 替换分数门，
 标签信息由廉价 tags-only 通道供给（S1.2a）。LLM 调用收敛为三类：
 ① 廉价标签通道（全量候选，tags-only prompt，单价待实测）；
 ② 完整评估（仅 y=1 候选——入池需要完整分 + 结构化标注 + pool 文案，

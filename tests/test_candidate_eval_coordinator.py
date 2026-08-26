@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import pytest
 
@@ -13,6 +13,7 @@ from openbiliclaw.discovery.candidate_pipeline import (
     DiscoveryCandidatePipeline,
 )
 from openbiliclaw.discovery.candidate_pool import DiscoveryCandidateWrite
+from openbiliclaw.discovery.engine import ContentDiscoveryEngine, DiscoveredContent
 from openbiliclaw.llm.base import LLMFallbackError, LLMRateLimitError
 from openbiliclaw.llm.service import LLMProviderExecutionError
 from openbiliclaw.runtime.candidate_eval import (
@@ -22,8 +23,8 @@ from openbiliclaw.runtime.candidate_eval import (
 )
 from openbiliclaw.storage.database import Database
 
-if TYPE_CHECKING:
-    from openbiliclaw.discovery.engine import DiscoveredContent
+from .test_discovery_engine import _DynamicBatchLLMService
+from .test_search_strategy import _build_profile
 
 
 @dataclass
@@ -195,6 +196,253 @@ async def test_coordinator_caps_worker_claims_at_three_batches_and_ninety_raw() 
     assert [len(batch.claim.rows) for batch in pipeline.started] == [30, 30, 30]
     assert sum(len(batch.claim.rows) for batch in pipeline.started) == 90
     assert pipeline.max_in_flight == 3
+
+    await coordinator.stop()
+    await task
+
+
+async def _wait_until(predicate: Any, *, timeout: float = 2.0) -> None:
+    async with asyncio.timeout(timeout):
+        while not predicate():
+            await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_same_fill_workers_share_one_profile_provider_call() -> None:
+    """Cognition can rewrite soul between get_profile calls; one fill must not."""
+
+    generations: list[int] = []
+    calls = {"n": 0}
+
+    def profile_provider() -> dict[str, int]:
+        calls["n"] += 1
+        return {"generation": calls["n"]}
+
+    class _RecordingPipeline(_FakeStagedPipeline):
+        async def evaluate_claim(
+            self, claim: CandidateEvalClaim, profile: Any
+        ) -> CandidateEvalOutcome:
+            generations.append(int(profile["generation"]))
+            return await super().evaluate_claim(claim, profile)
+
+    pipeline = _RecordingPipeline(candidate_count=90)
+    coordinator = CandidateEvalCoordinator(
+        pipeline=pipeline,  # type: ignore[arg-type]
+        snapshot_provider=lambda: CandidateEvalSnapshot(
+            available=pipeline.available,
+            target=600,
+            pending_eval=pipeline.pending_eval,
+            evaluating=pipeline.in_flight * 30,
+            evaluated_pending_admission=pipeline.evaluated_pending_admission,
+            admitted_pending_copy=pipeline.admitted_pending_copy,
+        ),
+        profile_provider=profile_provider,
+        worker_count=3,
+        batch_size=30,
+        safety_wake_seconds=0.05,
+    )
+    task = asyncio.create_task(coordinator.run_forever())
+    coordinator.notify("tick-freeze")
+    await pipeline.wait_for_started(3)
+    await _wait_until(lambda: len(generations) == 3)
+
+    assert calls["n"] == 1
+    assert generations == [1, 1, 1]
+
+    await coordinator.stop()
+    await task
+
+
+@pytest.mark.asyncio
+async def test_next_fill_loads_a_fresh_profile() -> None:
+    generations: list[int] = []
+    calls = {"n": 0}
+
+    def profile_provider() -> dict[str, int]:
+        calls["n"] += 1
+        return {"generation": calls["n"]}
+
+    class _RecordingPipeline(_FakeStagedPipeline):
+        async def evaluate_claim(
+            self, claim: CandidateEvalClaim, profile: Any
+        ) -> CandidateEvalOutcome:
+            generations.append(int(profile["generation"]))
+            return await super().evaluate_claim(claim, profile)
+
+    pipeline = _RecordingPipeline(candidate_count=2)
+    coordinator = CandidateEvalCoordinator(
+        pipeline=pipeline,  # type: ignore[arg-type]
+        snapshot_provider=lambda: CandidateEvalSnapshot(
+            available=pipeline.available,
+            target=600,
+            pending_eval=pipeline.pending_eval,
+            evaluating=pipeline.in_flight,
+            evaluated_pending_admission=pipeline.evaluated_pending_admission,
+            admitted_pending_copy=pipeline.admitted_pending_copy,
+        ),
+        profile_provider=profile_provider,
+        worker_count=1,
+        batch_size=1,
+        safety_wake_seconds=0.05,
+    )
+    task = asyncio.create_task(coordinator.run_forever())
+    coordinator.notify("next-fill")
+    await pipeline.wait_for_started(1)
+    await _wait_until(lambda: len(generations) == 1)
+    pipeline.finish(0, cached=1)
+    await pipeline.wait_for_started(2)
+    await _wait_until(lambda: len(generations) == 2)
+
+    assert generations == [1, 2]
+    assert calls["n"] == 2
+
+    await coordinator.stop()
+    await task
+
+
+class _TickEvalPipeline:
+    """Claim two single-item batches against a real discovery engine."""
+
+    def __init__(self, engine: ContentDiscoveryEngine) -> None:
+        self.discovery_engine = engine
+        self.pending_eval = 2
+        self.available = 0
+        self.in_flight = 0
+        self.started: list[CandidateEvalClaim] = []
+        self.profile_digests: list[str] = []
+        self.negative_digests: list[str] = []
+        self._started_event = asyncio.Event()
+        self.evaluated_pending_admission = 0
+        self.admitted_pending_copy = 0
+        self.released_tokens: list[str] = []
+
+    def claim_batch(self, *, limit: int) -> CandidateEvalClaim | None:
+        if self.pending_eval <= 0:
+            return None
+        index = len(self.started) + 1
+        token = f"tick-{index}"
+        item = DiscoveredContent(
+            bvid=f"BVTICK{index}",
+            title=f"同tick候选{index}",
+            source_strategy="search",
+        )
+        claim = CandidateEvalClaim(
+            token=token,
+            rows=({"id": index, "claim_token": token},),
+            items=(item,),
+        )
+        self.pending_eval -= 1
+        self.in_flight += 1
+        self.started.append(claim)
+        self._started_event.set()
+        return claim
+
+    async def wait_for_started(self, count: int) -> None:
+        async with asyncio.timeout(2):
+            while len(self.started) < count:
+                self._started_event.clear()
+                await self._started_event.wait()
+
+    async def evaluate_claim(self, claim: CandidateEvalClaim, profile: Any) -> CandidateEvalOutcome:
+        scores = await self.discovery_engine.evaluate_content_batch(
+            list(claim.items),
+            profile,
+            source_context="mixed",
+            batch_size=len(claim.items),
+        )
+        item = claim.items[0]
+        self.profile_digests.append(str(item.profile_digest or ""))
+        self.negative_digests.append(str(item.negative_digest or ""))
+        return CandidateEvalOutcome(
+            claim=claim,
+            scores=tuple(float(score) for score in scores),
+            elapsed_seconds=0.01,
+        )
+
+    async def complete_claim(
+        self,
+        outcome: CandidateEvalOutcome,
+        *,
+        admission_limit: int | None = None,
+    ) -> dict[str, int]:
+        self.in_flight = max(0, self.in_flight - 1)
+        return {"evaluated": len(outcome.claim.rows), "cached": 0, "rejected": 0, "stale": 0}
+
+    def release_claim(
+        self,
+        claim: CandidateEvalClaim,
+        *,
+        reason: str,
+        increment_attempts: bool = False,
+    ) -> int:
+        if claim.token in self.released_tokens:
+            return 0
+        self.released_tokens.append(claim.token)
+        self.pending_eval += len(claim.rows)
+        self.in_flight = max(0, self.in_flight - 1)
+        return len(claim.rows)
+
+
+class _TickNegativesEngine(ContentDiscoveryEngine):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.negative_loads = 0
+
+    def _load_live_negative_exemplars(self) -> list[dict[str, object]] | None:
+        self.negative_loads += 1
+        title = "第一负例" if self.negative_loads == 1 else "第二负例"
+        return [{"title": title, "reason": "quick_exit", "age_days": 0}]
+
+
+@pytest.mark.asyncio
+async def test_same_tick_workers_share_one_evaluation_digest() -> None:
+    """Numeric gate: len({profile_digest}) == 1 even when get_profile would drift."""
+
+    calls = {"n": 0}
+
+    def profile_provider() -> Any:
+        calls["n"] += 1
+        profile = _build_profile()
+        profile.preferences.interests[0].name = f"tick兴趣{calls['n']}"
+        return profile
+
+    engine = _TickNegativesEngine(
+        llm_service=_DynamicBatchLLMService(),
+        eval_prefilter_mode="off",
+    )
+    pipeline = _TickEvalPipeline(engine)
+    coordinator = CandidateEvalCoordinator(
+        pipeline=pipeline,  # type: ignore[arg-type]
+        snapshot_provider=lambda: CandidateEvalSnapshot(
+            available=pipeline.available,
+            target=600,
+            pending_eval=pipeline.pending_eval,
+            evaluating=pipeline.in_flight,
+            evaluated_pending_admission=pipeline.evaluated_pending_admission,
+            admitted_pending_copy=pipeline.admitted_pending_copy,
+        ),
+        profile_provider=profile_provider,
+        worker_count=2,
+        batch_size=1,
+        safety_wake_seconds=0.05,
+    )
+    task = asyncio.create_task(coordinator.run_forever())
+    coordinator.notify("digest-freeze")
+    await pipeline.wait_for_started(2)
+    await _wait_until(lambda: len(pipeline.profile_digests) == 2)
+
+    assert calls["n"] == 1
+    assert engine.negative_loads == 1
+    assert len(set(pipeline.profile_digests)) == 1
+    assert pipeline.profile_digests[0]
+    assert len(set(pipeline.negative_digests)) == 1
+    assert pipeline.negative_digests[0]
+    prompts = engine._llm_service.user_inputs  # type: ignore[union-attr]
+    joined = "\n".join(prompts)
+    assert "tick兴趣1" in joined
+    assert "tick兴趣2" not in joined
+    assert "第一负例" in joined
+    assert "第二负例" not in joined
 
     await coordinator.stop()
     await task
