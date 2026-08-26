@@ -70,6 +70,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--encoder-lr", type=float, default=1e-5)
     parser.add_argument("--task-lr", type=float, default=5e-4)
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="auto (cuda when available), cuda, or cpu.",
+    )
+    parser.add_argument(
+        "--precision",
+        choices=("fp16", "bf16", "none"),
+        default="fp16",
+        help="Mixed precision on CUDA. bf16 is native on Blackwell (RTX 50xx).",
+    )
     return parser.parse_args(argv)
 
 
@@ -88,9 +99,21 @@ def main(argv: list[str] | None = None) -> int:
 
     print("=== GLiNER2 temporal LoRA pilot ===")
     print(f"  base model            {args.base_model}")
+
+    import torch
+
+    if str(args.device).strip().lower() == "cpu":
+        device = "cpu"
+    elif torch.cuda.is_available():
+        device = "cuda"
+    else:
+        print("  cuda unavailable      falling back to cpu")
+        device = "cpu"
+    precision = str(args.precision) if device == "cuda" else "none"
+    print(f"  device                {device} ({precision})")
     print(f"  train / val           {train_path.name} / {val_path.name}")
 
-    model = AutoExtractor.from_pretrained(str(args.base_model), map_location="cpu")
+    model = AutoExtractor.from_pretrained(str(args.base_model), map_location=device)
     # char splitter keeps Latin words whole and splits CJK per character —
     # correct for our mixed zh/en corpus under one global setting.
     try:
@@ -117,6 +140,8 @@ def main(argv: list[str] | None = None) -> int:
         save_best=True,
         logging_steps=10,
         seed=int(args.seed),
+        fp16=precision == "fp16",
+        bf16=precision == "bf16",
         # Windows spawn + pickled worker processes break inside the sandboxed
         # runtime; in-process loading is fast enough for these data sizes.
         num_workers=0,
@@ -133,6 +158,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  best val metric       {results.get('best_metric')}")
     print(f"  total steps           {results.get('total_steps')}")
     print(f"  wall time             {elapsed / 60:.1f} min")
+    if device == "cuda":
+        peak = torch.cuda.max_memory_allocated() / 1024**3
+        print(f"  peak VRAM             {peak:.2f} GB")
     print(f"  adapter dir           {out_dir}")
     best = out_dir / "best"
     if best.is_dir():
