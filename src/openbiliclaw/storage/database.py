@@ -1181,6 +1181,9 @@ CREATE TABLE IF NOT EXISTS discovery_candidates (
     tag_channel_source    TEXT NOT NULL DEFAULT '',
     tag_channel_model     TEXT NOT NULL DEFAULT '',
     tag_channel_at        TEXT NOT NULL DEFAULT '',
+    gliner_entities_json  TEXT NOT NULL DEFAULT '',
+    gliner_model          TEXT NOT NULL DEFAULT '',
+    gliner_at             TEXT NOT NULL DEFAULT '',
     temporal_class        TEXT NOT NULL DEFAULT 'unknown',
     temporal_confidence   REAL NOT NULL DEFAULT 0.0,
     temporal_reason       TEXT NOT NULL DEFAULT '',
@@ -6319,6 +6322,50 @@ class Database:
                     style_key,
                     temporal_class,
                     source,
+                    model,
+                    tagged_at,
+                    candidate_id,
+                ),
+            )
+            if cursor.rowcount:
+                updated += 1
+        if updated:
+            self.conn.commit()
+        return updated
+
+    def update_discovery_candidate_gliner_tags(
+        self,
+        rows: Sequence[Mapping[str, Any]],
+    ) -> int:
+        """Persist local GLiNER entity tags without touching teacher columns.
+
+        Updates ``gliner_entities_json`` / ``gliner_model`` / ``gliner_at``
+        only. The payload is stored verbatim (the pipeline sends canonical
+        JSON from :func:`entities_payload_to_json`); an empty-list marker
+        still stamps ``gliner_at`` so retries skip re-running inference.
+        """
+
+        updated = 0
+        stamped_at = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        for row in rows:
+            candidate_id = int(row.get("candidate_id") or row.get("id") or 0)
+            if candidate_id <= 0:
+                continue
+            payload = str(row.get("gliner_entities_json") or "").strip()
+            if not payload:
+                continue
+            model = str(row.get("gliner_model") or "").strip()
+            tagged_at = str(row.get("gliner_at") or "").strip() or stamped_at
+            cursor = self.conn.execute(
+                """
+                UPDATE discovery_candidates
+                SET gliner_entities_json = ?,
+                    gliner_model = ?,
+                    gliner_at = ?
+                WHERE id = ?
+                """,
+                (
+                    payload,
                     model,
                     tagged_at,
                     candidate_id,
@@ -13845,6 +13892,12 @@ class Database:
             "tag_channel_source": "TEXT NOT NULL DEFAULT ''",
             "tag_channel_model": "TEXT NOT NULL DEFAULT ''",
             "tag_channel_at": "TEXT NOT NULL DEFAULT ''",
+            # Local GLiNER entity tags (pool-entry stage). ``gliner_at`` is
+            # set even when the payload is the empty-list marker so claim
+            # retries can tell tagged-but-empty from never-tagged.
+            "gliner_entities_json": "TEXT NOT NULL DEFAULT ''",
+            "gliner_model": "TEXT NOT NULL DEFAULT ''",
+            "gliner_at": "TEXT NOT NULL DEFAULT ''",
         }
         for column_name, column_type in required_columns.items():
             if column_name in existing_columns:

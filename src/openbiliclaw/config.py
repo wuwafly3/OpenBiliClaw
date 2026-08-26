@@ -153,6 +153,29 @@ _DEFAULT_EVAL_PREFILTER_MODE = "shadow"
 _SUPPORTED_EVAL_PREFILTER_MODES = {"off", "shadow", "enforce"}
 _DEFAULT_TAG_CHANNEL_MODE = "off"
 _SUPPORTED_TAG_CHANNEL_MODES = {"off", "shadow", "enforce"}
+# Local GLiNER entity tagging (pool-entry stage). Defaults mirror
+# openbiliclaw.discovery.gliner_tagger without importing it (config stays
+# import-light). Off by default: the ``gliner`` extra pulls torch and the
+# first enabled run downloads model weights.
+_DEFAULT_GLINER_TAG_ENABLED = False
+_DEFAULT_GLINER_MODEL_ID = "gliner-community/gliner_large-v2.5"
+_DEFAULT_GLINER_LABELS: tuple[str, ...] = (
+    "游戏",
+    "动漫",
+    "影视",
+    "音乐",
+    "人物",
+    "组织",
+    "产品",
+    "地点",
+)
+_MAX_GLINER_LABELS = 30
+_DEFAULT_GLINER_THRESHOLD = 0.5
+_DEFAULT_GLINER_MAX_CHARS = 512
+# ``auto`` routes CJK-dominant texts through jieba and keeps whitespace for
+# Latin texts; the other values force one gliner WordsSplitter for all inputs.
+_SUPPORTED_GLINER_WORD_SPLITTERS = ("auto", "whitespace", "jieba", "hanlp", "universal")
+_DEFAULT_GLINER_WORD_SPLITTER = "auto"
 _DEFAULT_RELEVANCE_SCORER = "llm"
 _SUPPORTED_RELEVANCE_SCORERS = {"llm", "shadow", "ml"}
 _DEFAULT_MULTIMODAL_BATCH_SIZE = 8
@@ -1087,6 +1110,17 @@ class DiscoveryConfig:
     # extra calls. ``shadow`` is a backfill/probe path, not the claim hot path.
     # ``enforce`` tags pending_eval before full eval still runs.
     tag_channel_mode: str = _DEFAULT_TAG_CHANNEL_MODE
+    # Local zero-shot NER entity tags (GLiNER v2.5) written alongside the LLM
+    # tag channel during claim evaluation. Requires the optional ``gliner``
+    # extra; when it is missing the engine logs once and tags nothing.
+    gliner_tag_enabled: bool = _DEFAULT_GLINER_TAG_ENABLED
+    gliner_model_id: str = _DEFAULT_GLINER_MODEL_ID
+    gliner_labels: tuple[str, ...] = _DEFAULT_GLINER_LABELS
+    gliner_threshold: float = _DEFAULT_GLINER_THRESHOLD
+    gliner_max_chars: int = _DEFAULT_GLINER_MAX_CHARS
+    # ``auto``（默认）按文本语种路由：中日韩为主的输入走 jieba 分词，拉丁文
+    # 保持 whitespace；其余取值强制所有输入使用同一个切分器。非法值回退 auto。
+    gliner_word_splitter: str = _DEFAULT_GLINER_WORD_SPLITTER
     # Wave 1 admission scorer. ``llm`` is the production path. ``shadow``
     # runs numpy inference beside the teacher and never changes admission.
     # ``ml`` is accepted but still observational until S1.5 gates pass.
@@ -2708,6 +2742,22 @@ def _build_discovery(discovery_raw: dict[str, Any]) -> DiscoveryConfig:
             discovery_raw.get("eval_prefilter_mode")
         ),
         tag_channel_mode=_normalize_tag_channel_mode(discovery_raw.get("tag_channel_mode")),
+        gliner_tag_enabled=_coerce_bool(
+            discovery_raw.get("gliner_tag_enabled"),
+            default=_DEFAULT_GLINER_TAG_ENABLED,
+        ),
+        gliner_model_id=_normalize_gliner_model_id(discovery_raw.get("gliner_model_id")),
+        gliner_labels=_normalize_gliner_labels(discovery_raw.get("gliner_labels")),
+        gliner_threshold=_normalize_gliner_threshold(discovery_raw.get("gliner_threshold")),
+        gliner_word_splitter=_normalize_gliner_word_splitter(
+            discovery_raw.get("gliner_word_splitter")
+        ),
+        gliner_max_chars=_normalize_scheduler_int(
+            discovery_raw.get("gliner_max_chars"),
+            default=_DEFAULT_GLINER_MAX_CHARS,
+            min_value=64,
+            max_value=2048,
+        ),
         relevance_scorer=_normalize_relevance_scorer(discovery_raw.get("relevance_scorer")),
         relevance_model_path=(str(discovery_raw.get("relevance_model_path") or "").strip()),
         multimodal_evaluation_enabled=_coerce_bool(
@@ -2804,6 +2854,66 @@ def _normalize_tag_channel_mode(value: object) -> str:
         return _DEFAULT_TAG_CHANNEL_MODE
     mode = value.strip().lower()
     return mode or _DEFAULT_TAG_CHANNEL_MODE
+
+
+def _normalize_gliner_model_id(value: object) -> str:
+    if not isinstance(value, str):
+        return _DEFAULT_GLINER_MODEL_ID
+    return value.strip() or _DEFAULT_GLINER_MODEL_ID
+
+
+def _normalize_gliner_word_splitter(value: object) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in _SUPPORTED_GLINER_WORD_SPLITTERS:
+        return normalized
+    return _DEFAULT_GLINER_WORD_SPLITTER
+
+
+def _normalize_gliner_labels(value: object) -> tuple[str, ...]:
+    """Normalize GLiNER label lists; empty input falls back to the defaults.
+
+    Accepts a list/tuple of strings or a comma-separated string. Dedupes
+    preserving order and caps at the GLiNER forward-pass ceiling (30 types).
+    """
+
+    if isinstance(value, str):
+        raw_items: list[Any] = value.split(",")
+    elif isinstance(value, (list, tuple)):
+        raw_items = list(value)
+    else:
+        return _DEFAULT_GLINER_LABELS
+    labels: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        label = str(item or "").strip()
+        if not label or label in seen:
+            continue
+        seen.add(label)
+        labels.append(label)
+        if len(labels) >= _MAX_GLINER_LABELS:
+            break
+    return tuple(labels) if labels else _DEFAULT_GLINER_LABELS
+
+
+def _normalize_gliner_threshold(value: object, *, default: float = -1.0) -> float:
+    """Normalize the GLiNER entity score floor in ``[0.05, 1]``.
+
+    ``default`` falls back to :data:`_DEFAULT_GLINER_THRESHOLD` when unset,
+    so both the parser and API write paths share one clamping rule.
+    """
+
+    resolved_default = _DEFAULT_GLINER_THRESHOLD if default < 0 else default
+    if isinstance(value, bool):
+        return resolved_default
+    if not isinstance(value, (int, float, str)):
+        return resolved_default
+    try:
+        threshold = float(value)
+    except (TypeError, ValueError):
+        return resolved_default
+    if threshold != threshold or threshold < 0.05 or threshold > 1.0:
+        return resolved_default
+    return threshold
 
 
 def _normalize_relevance_scorer(value: object) -> str:
@@ -5312,6 +5422,12 @@ def _render_config_toml(
             f"inspiration_breadth = {_toml_string(config.discovery.inspiration_breadth)}",
             f"eval_prefilter_mode = {_toml_string(config.discovery.eval_prefilter_mode)}",
             f"tag_channel_mode = {_toml_string(config.discovery.tag_channel_mode)}",
+            f"gliner_tag_enabled = {_toml_bool(config.discovery.gliner_tag_enabled)}",
+            f"gliner_model_id = {_toml_string(config.discovery.gliner_model_id)}",
+            f"gliner_labels = {_toml_str_list(list(config.discovery.gliner_labels))}",
+            f"gliner_threshold = {config.discovery.gliner_threshold:g}",
+            f"gliner_max_chars = {config.discovery.gliner_max_chars}",
+            f"gliner_word_splitter = {_toml_string(config.discovery.gliner_word_splitter)}",
             f"relevance_scorer = {_toml_string(config.discovery.relevance_scorer)}",
             f"relevance_model_path = {_toml_string(config.discovery.relevance_model_path)}",
             "multimodal_evaluation_enabled = "

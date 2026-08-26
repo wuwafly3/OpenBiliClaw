@@ -3906,3 +3906,89 @@ class TestUnifiedInterestLineFlag:
             example = tomllib.load(handle)
 
         assert example["scheduler"]["unified_interest_line"] is True
+
+
+# ── GLiNER entity tagging ([discovery] gliner_*) ────────────────────────────
+
+
+def test_gliner_tag_defaults_are_off_with_v2_5_model() -> None:
+    config = Config()
+
+    assert config.discovery.gliner_tag_enabled is False
+    assert config.discovery.gliner_model_id == "gliner-community/gliner_large-v2.5"
+    assert "游戏" in config.discovery.gliner_labels
+    assert config.discovery.gliner_threshold == 0.5
+    assert config.discovery.gliner_max_chars == 512
+
+
+def test_discovery_glider_toml_keys_round_trip(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "[discovery]\n"
+        "gliner_tag_enabled = true\n"
+        'gliner_model_id = "local/gliner"\n'
+        'gliner_labels = ["游戏", "动漫", "游戏"]\n'
+        "gliner_threshold = 0.7\n"
+        "gliner_max_chars = 1024\n",
+        encoding="utf-8",
+    )
+
+    loaded = load_config(config_path)
+
+    assert loaded.discovery.gliner_tag_enabled is True
+    assert loaded.discovery.gliner_model_id == "local/gliner"
+    # Duplicate labels dedupe preserving order.
+    assert loaded.discovery.gliner_labels == ("游戏", "动漫")
+    assert loaded.discovery.gliner_threshold == 0.7
+    assert loaded.discovery.gliner_max_chars == 1024
+
+    save_config(loaded, config_path)
+    reloaded = load_config(config_path)
+    assert reloaded.discovery.gliner_labels == ("游戏", "动漫")
+    assert reloaded.discovery.gliner_tag_enabled is True
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, ("游戏",)),
+        ([], ("游戏",)),
+        ("", ("游戏",)),
+        ([" 游戏 ", "", 42], ("游戏", "42")),
+        ("游戏, 动漫 ,影视", ("游戏", "动漫", "影视")),
+    ],
+)
+def test_normalize_gliner_labels(raw: object, expected: tuple[str, ...]) -> None:
+    defaults = config_module._DEFAULT_GLINER_LABELS
+    result = config_module._normalize_gliner_labels(raw)
+    if raw in (None, [], ""):
+        assert result == defaults
+    else:
+        assert result == expected
+
+
+def test_normalize_gliner_labels_caps_at_thirty_types() -> None:
+    result = config_module._normalize_gliner_labels([f"label{i}" for i in range(50)])
+    assert len(result) == 30
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (0.5, 0.5),
+        (0.05, 0.05),
+        (1.0, 1.0),
+        (0.049, 0.5),
+        ("0.6", 0.6),
+        (True, 0.5),
+        ("bad", 0.5),
+        (None, 0.5),
+    ],
+)
+def test_normalize_gliner_threshold(raw: object, expected: float) -> None:
+    assert config_module._normalize_gliner_threshold(raw) == expected
+
+
+def test_normalize_gliner_model_id_falls_back_to_default() -> None:
+    assert config_module._normalize_gliner_model_id("  ") == ("gliner-community/gliner_large-v2.5")
+    assert config_module._normalize_gliner_model_id(None) == ("gliner-community/gliner_large-v2.5")

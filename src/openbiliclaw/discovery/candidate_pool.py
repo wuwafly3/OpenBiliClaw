@@ -330,6 +330,8 @@ def row_to_discovered_content(row: dict[str, Any]) -> DiscoveredContent:
         tag_channel_temporal_class=str(row.get("tag_channel_temporal_class") or "unknown"),
         tag_channel_source=str(row.get("tag_channel_source") or ""),
         tag_channel_model=str(row.get("tag_channel_model") or ""),
+        gliner_entities_json=str(row.get("gliner_entities_json") or ""),
+        gliner_model=str(row.get("gliner_model") or ""),
         temporal_class=str(row.get("temporal_class") or "unknown"),
         temporal_confidence=float(row.get("temporal_confidence") or 0.0),
         temporal_reason=str(row.get("temporal_reason") or ""),

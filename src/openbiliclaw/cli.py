@@ -1145,6 +1145,14 @@ def _build_discovery_engine() -> Any:
         ),
         eval_prefilter_mode=str(getattr(discovery_cfg, "eval_prefilter_mode", "shadow")),
         tag_channel_mode=str(getattr(discovery_cfg, "tag_channel_mode", "off")),
+        gliner_tag_enabled=bool(getattr(discovery_cfg, "gliner_tag_enabled", False)),
+        gliner_model_id=str(
+            getattr(discovery_cfg, "gliner_model_id", "") or "gliner-community/gliner_large-v2.5"
+        ),
+        gliner_labels=list(getattr(discovery_cfg, "gliner_labels", []) or []),
+        gliner_threshold=float(getattr(discovery_cfg, "gliner_threshold", 0.5)),
+        gliner_max_chars=int(getattr(discovery_cfg, "gliner_max_chars", 512)),
+        gliner_word_splitter=str(getattr(discovery_cfg, "gliner_word_splitter", "auto")),
         relevance_scorer=str(getattr(discovery_cfg, "relevance_scorer", "llm")),
         relevance_model_path=resolve_model_path(
             getattr(discovery_cfg, "relevance_model_path", ""),

@@ -566,6 +566,7 @@ class DiscoveryCandidatePipeline:
         """Run only the LLM evaluation stage; this method performs no writes."""
 
         started = self.time_fn()
+        await self._maybe_gliner_tag_claim(claim)
         await self._maybe_tag_claim(claim)
         scores = await self.discovery_engine.evaluate_content_batch(
             list(claim.items),
@@ -648,6 +649,64 @@ class DiscoveryCandidatePipeline:
         except Exception:
             logger.warning(
                 "tag-channel persist failed for %d row(s); continuing with full eval",
+                len(persist_rows),
+                exc_info=True,
+            )
+
+    async def _maybe_gliner_tag_claim(self, claim: CandidateEvalClaim) -> None:
+        """Local GLiNER entity tags for untagged claim items before full eval.
+
+        Mirrors ``_maybe_tag_claim``'s fail-open contract: tagging or persist
+        errors log WARNING and evaluation still proceeds. Engines without the
+        capability (disabled, older stubs) make zero calls. Items whose
+        payload is already present — including the ``"[]"`` found-nothing
+        marker — are skipped.
+        """
+
+        apply_fn = getattr(self.discovery_engine, "apply_gliner_entity_tags", None)
+        if not callable(apply_fn):
+            return
+        untagged = [
+            item
+            for item in claim.items
+            if not str(getattr(item, "gliner_entities_json", "") or "").strip()
+        ]
+        if not untagged:
+            return
+        try:
+            await apply_fn(untagged)
+        except Exception:
+            logger.warning(
+                "gliner entity tagging failed for %d candidate(s); continuing with full eval",
+                len(untagged),
+                exc_info=True,
+            )
+            return
+        persist = getattr(self.database, "update_discovery_candidate_gliner_tags", None)
+        if not callable(persist):
+            return
+        untagged_ids = {id(item) for item in untagged}
+        persist_rows: list[dict[str, Any]] = []
+        for row, item in zip(claim.rows, claim.items, strict=True):
+            if id(item) not in untagged_ids:
+                continue
+            payload = str(getattr(item, "gliner_entities_json", "") or "").strip()
+            if not payload:
+                continue
+            persist_rows.append(
+                {
+                    "candidate_id": int(row.get("id") or 0),
+                    "gliner_entities_json": payload,
+                    "gliner_model": str(getattr(item, "gliner_model", "") or ""),
+                }
+            )
+        if not persist_rows:
+            return
+        try:
+            persist(persist_rows)
+        except Exception:
+            logger.warning(
+                "gliner tag persist failed for %d row(s); continuing with full eval",
                 len(persist_rows),
                 exc_info=True,
             )

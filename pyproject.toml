@@ -64,6 +64,17 @@ dev = [
 local-llm = [
     "ollama>=0.4",
 ]
+gliner = [
+    # Local zero-shot NER entity tags for the pool-entry tagging stage
+    # ([discovery] gliner_tag_enabled = true). ``gliner`` pulls torch
+    # transitively (GB-scale install) and downloads model weights on first
+    # use, so it stays an opt-in extra.
+    "gliner>=0.2.13",
+    # Chinese word splitting for [discovery] gliner_word_splitter="auto"
+    # (CJK-dominant texts route through jieba; without it they fall back to
+    # whitespace and entity recall collapses).
+    "jieba3>=1.0",
+]
 x = [
     # Backwards-compatible alias for users/scripts that already install
     # ``openbiliclaw[x]``. The dependency is also part of the default runtime set.
@@ -139,6 +150,8 @@ module = [
     "aiohttp",
     "claude_agent_sdk",
     "claude_agent_sdk.*",
+    "gliner",
+    "gliner.*",
     "playwright.*",
     "twitter_cli",
     "twitter_cli.*",

@@ -16915,6 +16915,12 @@ def create_app(
                 admission_min_score=cfg.discovery.admission_min_score,
                 eval_prefilter_mode=cfg.discovery.eval_prefilter_mode,
                 tag_channel_mode=cfg.discovery.tag_channel_mode,
+                gliner_tag_enabled=cfg.discovery.gliner_tag_enabled,
+                gliner_model_id=cfg.discovery.gliner_model_id,
+                gliner_labels=list(cfg.discovery.gliner_labels),
+                gliner_threshold=cfg.discovery.gliner_threshold,
+                gliner_max_chars=cfg.discovery.gliner_max_chars,
+                gliner_word_splitter=cfg.discovery.gliner_word_splitter,
                 relevance_scorer=cfg.discovery.relevance_scorer,
                 relevance_model_path=cfg.discovery.relevance_model_path,
                 candidate_eval_concurrency=cfg.discovery.candidate_eval_concurrency,
@@ -18289,6 +18295,8 @@ def create_app(
             _DEFAULT_EVAL_MIN_BATCH_SIZE,
             _DEFAULT_EXPLORE_REFRESH_MINUTES,
             _DEFAULT_FEEDBACK_BATCH_THRESHOLD,
+            _DEFAULT_GLINER_MAX_CHARS,
+            _DEFAULT_GLINER_THRESHOLD,
             _DEFAULT_KEYFRAME_FETCH_LIMIT,
             _DEFAULT_KEYFRAME_MAX_FRAMES,
             _DEFAULT_KEYWORD_DIGEST_GRACE_HOURS,
@@ -18311,6 +18319,10 @@ def create_app(
             _collect_config_issues,
             _default_config_path,
             _normalize_extension_disconnect_grace,
+            _normalize_gliner_labels,
+            _normalize_gliner_model_id,
+            _normalize_gliner_threshold,
+            _normalize_gliner_word_splitter,
             _normalize_pool_source_shares,
             _normalize_probability,
             _normalize_scheduler_float,
@@ -19309,6 +19321,11 @@ def create_app(
                         1,
                         20,
                     ),
+                    "gliner_max_chars": (
+                        _DEFAULT_GLINER_MAX_CHARS,
+                        64,
+                        2048,
+                    ),
                     "keyframe_max_frames": (_DEFAULT_KEYFRAME_MAX_FRAMES, 1, 12),
                     "keyframe_fetch_limit": (_DEFAULT_KEYFRAME_FETCH_LIMIT, 1, 200),
                     "danmaku_fetch_limit": (_DEFAULT_DANMAKU_FETCH_LIMIT, 1, 200),
@@ -19345,6 +19362,22 @@ def create_app(
                             detail="discovery.tag_channel_mode must be off, shadow, or enforce",
                         )
                     cfg.discovery.tag_channel_mode = tag_channel_mode
+                if "gliner_tag_enabled" in ddata:
+                    cfg.discovery.gliner_tag_enabled = _as_bool(ddata["gliner_tag_enabled"])
+                if "gliner_model_id" in ddata:
+                    cfg.discovery.gliner_model_id = _normalize_gliner_model_id(
+                        ddata["gliner_model_id"]
+                    )
+                if "gliner_labels" in ddata:
+                    cfg.discovery.gliner_labels = _normalize_gliner_labels(ddata["gliner_labels"])
+                if "gliner_threshold" in ddata:
+                    cfg.discovery.gliner_threshold = _normalize_gliner_threshold(
+                        ddata["gliner_threshold"], default=_DEFAULT_GLINER_THRESHOLD
+                    )
+                if "gliner_word_splitter" in ddata:
+                    cfg.discovery.gliner_word_splitter = _normalize_gliner_word_splitter(
+                        ddata["gliner_word_splitter"]
+                    )
                 if "relevance_scorer" in ddata:
                     relevance_scorer = str(ddata["relevance_scorer"] or "").strip().lower()
                     if relevance_scorer not in {"llm", "shadow", "ml"}:

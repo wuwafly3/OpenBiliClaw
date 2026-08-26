@@ -1125,6 +1125,12 @@ def test_build_openclaw_adapter_services_reuses_shared_database(
             concurrency: object = None,
             eval_prefilter_mode: str = "shadow",
             tag_channel_mode: str = "off",
+            gliner_tag_enabled: bool = False,
+            gliner_model_id: str = "",
+            gliner_labels: object = None,
+            gliner_threshold: float = 0.5,
+            gliner_max_chars: int = 512,
+            gliner_word_splitter: str = "auto",
             relevance_scorer: str = "llm",
             relevance_model_path: str = "",
         ) -> None:
@@ -1133,6 +1139,12 @@ def test_build_openclaw_adapter_services_reuses_shared_database(
             self.concurrency = concurrency
             self.eval_prefilter_mode = eval_prefilter_mode
             self.tag_channel_mode = tag_channel_mode
+            self.gliner_tag_enabled = gliner_tag_enabled
+            self.gliner_model_id = gliner_model_id
+            self.gliner_labels = tuple(gliner_labels or ())
+            self.gliner_threshold = gliner_threshold
+            self.gliner_max_chars = gliner_max_chars
+            self.gliner_word_splitter = gliner_word_splitter
             self.relevance_scorer = relevance_scorer
             self.relevance_model_path = relevance_model_path
 

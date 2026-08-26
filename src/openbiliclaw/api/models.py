@@ -2318,6 +2318,14 @@ class DiscoveryConfigOut(BaseModel):
     admission_min_score: float = 0.60
     eval_prefilter_mode: Literal["off", "shadow", "enforce"] = "shadow"
     tag_channel_mode: Literal["off", "shadow", "enforce"] = "off"
+    gliner_tag_enabled: bool = False
+    gliner_model_id: str = "gliner-community/gliner_large-v2.5"
+    gliner_labels: list[str] = Field(
+        default_factory=lambda: ["游戏", "动漫", "影视", "音乐", "人物", "组织", "产品", "地点"]
+    )
+    gliner_threshold: float = 0.5
+    gliner_max_chars: int = Field(default=512, ge=64, le=2048)
+    gliner_word_splitter: Literal["auto", "whitespace", "jieba", "hanlp", "universal"] = "auto"
     relevance_scorer: Literal["llm", "shadow", "ml"] = "llm"
     relevance_model_path: str = ""
     candidate_eval_concurrency: int = Field(default=3, ge=1, le=3)

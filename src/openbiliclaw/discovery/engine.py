@@ -32,6 +32,13 @@ from openbiliclaw.discovery.eval_payload import (
     resolve_local_evaluation_results,
 )
 from openbiliclaw.discovery.eval_reason import normalize_evaluation_reason
+from openbiliclaw.discovery.gliner_tagger import (
+    DEFAULT_GLINER_LABELS,
+    DEFAULT_GLINER_WORD_SPLITTER,
+    GLINER_DEFAULT_MODEL_ID,
+    GLINER_SPLITTER_CHOICES,
+    GlinerEntityTagger,
+)
 from openbiliclaw.discovery.prefilter_audit import (
     PREFILTER_EXPLORE_EXEMPT_STATUS,
     PREFILTER_NO_INTERESTS_STATUS,
@@ -979,6 +986,11 @@ class DiscoveredContent:
     tag_channel_temporal_class: str = "unknown"
     tag_channel_source: str = ""
     tag_channel_model: str = ""
+    # Local zero-shot NER entity tags (GLiNER, see gliner_tagger). JSON
+    # payload ``[{"text","label","score"}…]``; ``"[]"`` means tagged-but-empty
+    # so claim retries never re-run inference. Never touches teacher tags.
+    gliner_entities_json: str = ""
+    gliner_model: str = ""
     # Wave 1 numpy admission scorer (in-memory only; not persisted).
     ml_admission_proba: float | None = None
     ml_admission_admitted: bool | None = None
@@ -1320,6 +1332,12 @@ class ContentDiscoveryEngine:
         eval_batch_concurrency: int = _DEFAULT_EVAL_BATCH_CONCURRENCY,
         eval_prefilter_mode: str = _EMBEDDING_PREFILTER_DEFAULT_MODE,
         tag_channel_mode: str = "off",
+        gliner_tag_enabled: bool = False,
+        gliner_model_id: str = GLINER_DEFAULT_MODEL_ID,
+        gliner_labels: Sequence[str] | None = None,
+        gliner_threshold: float = 0.5,
+        gliner_max_chars: int = 512,
+        gliner_word_splitter: str = DEFAULT_GLINER_WORD_SPLITTER,
         relevance_scorer: str = "llm",
         relevance_model_path: str = "",
         compact_evaluation_json: bool = False,
@@ -1343,6 +1361,33 @@ class ContentDiscoveryEngine:
         self.eval_batch_concurrency = max(1, min(16, int(eval_batch_concurrency)))
         self.eval_prefilter_mode = self._normalize_eval_prefilter_mode(eval_prefilter_mode)
         self.tag_channel_mode = self._normalize_tag_channel_mode(tag_channel_mode)
+        # Local GLiNER entity tagging (pool-entry stage; off by default).
+        self.gliner_tag_enabled = bool(gliner_tag_enabled)
+        self.gliner_model_id = str(gliner_model_id or "").strip() or GLINER_DEFAULT_MODEL_ID
+        cleaned_gliner_labels = [
+            str(label or "").strip()
+            for label in (gliner_labels or DEFAULT_GLINER_LABELS)
+            if str(label or "").strip()
+        ]
+        self.gliner_labels = tuple(cleaned_gliner_labels) or DEFAULT_GLINER_LABELS
+        try:
+            self.gliner_threshold = min(1.0, max(0.0, float(gliner_threshold)))
+        except (TypeError, ValueError):
+            self.gliner_threshold = 0.5
+        try:
+            self.gliner_max_chars = max(64, min(2048, int(gliner_max_chars)))
+        except (TypeError, ValueError):
+            self.gliner_max_chars = 512
+        normalized_splitter = (
+            str(gliner_word_splitter or DEFAULT_GLINER_WORD_SPLITTER).strip().lower()
+        )
+        self.gliner_word_splitter = (
+            normalized_splitter
+            if normalized_splitter in GLINER_SPLITTER_CHOICES
+            else DEFAULT_GLINER_WORD_SPLITTER
+        )
+        self._gliner_tagger: GlinerEntityTagger | None = None
+        self._gliner_unavailable_logged = False
         self.relevance_scorer = self._normalize_relevance_scorer(relevance_scorer)
         self.relevance_model_path = str(relevance_model_path or "").strip()
         self._admission_model: Any = None
@@ -2714,6 +2759,50 @@ class ContentDiscoveryEngine:
                 content.tag_channel_model,
             ),
         )
+
+    def _get_gliner_tagger(self) -> GlinerEntityTagger | None:
+        """Return the lazy GLiNER tagger, or ``None`` when unusable.
+
+        Missing ``gliner`` package / model-load failures warn once and then
+        disable quietly for this engine's lifetime — tagging must never take
+        down evaluation.
+        """
+
+        if not self.gliner_tag_enabled:
+            return None
+        if self._gliner_tagger is not None:
+            return self._gliner_tagger
+        if not GlinerEntityTagger.library_available():
+            if not self._gliner_unavailable_logged:
+                self._gliner_unavailable_logged = True
+                logger.warning(
+                    "discovery.gliner_tag_enabled is on but the 'gliner' package "
+                    "is not installed; entity tagging stays disabled "
+                    "(install with: pip install 'openbiliclaw[gliner]')"
+                )
+            return None
+        self._gliner_tagger = GlinerEntityTagger(
+            model_id=self.gliner_model_id,
+            labels=self.gliner_labels,
+            threshold=self.gliner_threshold,
+            max_chars=self.gliner_max_chars,
+            word_splitter=self.gliner_word_splitter,
+        )
+        return self._gliner_tagger
+
+    async def apply_gliner_entity_tags(self, contents: list[DiscoveredContent]) -> int:
+        """Tag local zero-shot NER entities onto untagged items.
+
+        Writes only ``gliner_entities_json`` / ``gliner_model``. Teacher tags,
+        cheap-channel tags, scores and admission are unchanged. Errors
+        propagate so callers apply their own fail-open policy.
+        Returns the number of newly tagged items.
+        """
+
+        tagger = self._get_gliner_tagger()
+        if tagger is None or not contents:
+            return 0
+        return await tagger.tag_contents(contents)
 
     async def tag_content_batch(
         self,

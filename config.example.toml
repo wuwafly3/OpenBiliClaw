@@ -601,6 +601,21 @@ eval_prefilter_mode = "shadow"
 # shadow = 后台抽样打标，不改变 admission；enforce = pending_eval 先打标再跑完整评估。
 # 非法值在保存时拒绝。在 Task 7 探针数字出来之前不要把线上 daemon 设为 enforce。
 tag_channel_mode = "off"
+# 本地 GLiNER 零样本实体打标（入池打标阶段，随候选评估写 discovery_candidates
+# 的 gliner_* 列，不额外调用 LLM、不改教师标签与准入分数）。需要先安装可选依赖：
+#   pip install "openbiliclaw[gliner]"   # gliner 会连带安装 torch（GB 级）
+# 首次启用会从 Hugging Face 下载模型权重；直连不通时可设 HF_ENDPOINT=
+# https://hf-mirror.com。缺包 / 加载失败只告警一次并继续正常评估。
+gliner_tag_enabled = false
+gliner_model_id = "gliner-community/gliner_large-v2.5"
+# 自定义标签列表（零样本，最多 30 个）；逗号分隔字符串也可以。
+gliner_labels = ["游戏", "动漫", "影视", "音乐", "人物", "组织", "产品", "地点"]
+gliner_threshold = 0.5
+gliner_max_chars = 512
+# 分词器：auto = 按语种自动路由（中日韩文本走 jieba、拉丁文保持 whitespace，
+# 需要额外安装 jieba3；缺失时自动回退 whitespace 并告警一次）；
+# 也可强制指定 whitespace / jieba / hanlp / universal。
+gliner_word_splitter = "auto"
 # Wave 1 准入 scorer：llm = 现行教师评估（默认）；shadow = numpy 推理旁路对照，
 # 不改 admission；ml 配置可保存但仍观察性运行，不跳过 evaluate_batch（S1.5 未过）。
 # 非法值在保存时拒绝。artifact 缺文件 / 版本不匹配 fail-open 回 LLM。

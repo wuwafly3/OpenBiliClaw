@@ -5,6 +5,7 @@
 ---
 
 ## 未发布
+- **本地 GLiNER 实体打标接入入池打标流程：** 新增 `discovery/gliner_tagger.py`，封装零样本 NER 模型 `gliner-community/gliner_large-v2.5`（Apache-2.0 多语言；可选依赖 `[gliner]`，连带 torch）。`evaluate_claim` 在廉价 LLM tags 通道之前对未打标候选跑本地推理，实体 JSON 写 `discovery_candidates` 新列 `gliner_entities_json` / `gliner_model` / `gliner_at`（自动迁移）；`"[]"` 标记已打标但无实体，重试不重复推理。不调用 LLM、不改教师标签与准入分数，缺包 / 加载失败 fail-open。新配置 `[discovery].gliner_tag_enabled`（默认 off）+ `gliner_model_id` / `gliner_labels` / `gliner_threshold` / `gliner_max_chars`，API GET/PUT、CLI、OpenClaw 三处装配透传。新增 `gliner_word_splitter="auto"` 中文支持：按语种在 jieba 与 whitespace 间自动路由（GLiNER 训练用空格分词，中文整句会退化为单 token；实测实体召回 61%→85%，拉丁文多词实体不受影响）。
 
 - **评估 loop 同 tick 冻一份 snapshot：** `CandidateEvalCoordinator._fill_open_slots` 对本批最多 3 个 worker 只调用一次 `get_profile()`，并 `capture_live_evaluation_context()` 冻住 gate compact 画像 + 负例。各 worker 把同一 `EvaluationContextSnapshot` 绑到自己的 ContextVar 再 `evaluate_claim`；下一 fill 才重新冻结。同一 drain tick 的 `profile_digest` / `negative_digest` 集合大小为 1。CLI / OpenClaw inline drain 仍按调用方传入的 profile。详见 [docs/plans/2026-08-21-ml-gate-ranker-separation-spec.md](plans/2026-08-21-ml-gate-ranker-separation-spec.md) D5。
 - **教师负例丢掉页面壳标题：** `recent_negative_exemplars` 只按完整网站标题丢弃 B 站首页 `哔哩哔哩 (゜-゜)つロ 干杯~-bilibili`（干杯短标题靠去掉尾部 `-bilibili` 命中，不单列）；不把 `ChatGLM` 当壳。不删 `events` 行。`negative_digest` 哈希过滤后的 prompt-visible 列表，教师 system prompt 不变。详见 [docs/plans/2026-08-21-ml-gate-ranker-separation-spec.md](plans/2026-08-21-ml-gate-ranker-separation-spec.md) D6。
