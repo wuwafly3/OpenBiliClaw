@@ -42,9 +42,9 @@ TEMPORAL_LABELS = ("breaking", "current", "evergreen", "historical", "versioned"
 TEMPORAL_DESCRIPTIONS = {
     "breaking": "刚发生或首发的突发内容，时效以小时计",
     "current": "近期热点或当下流行，时效以天到周计",
-    "evergreen": "长期有效的教程、科普、作品内容，不依赖时间",
-    "historical": "回顾历史事件、过往年代的内容",
-    "versioned": "与特定版本号强绑定，版本更新后即过时",
+    "evergreen": "长期有效的教程、科普、作品内容，价值不依赖时间",
+    "historical": "对已闭合事件或过去年代的回顾、考据、档案",
+    "versioned": "指涉可识别且仍在迭代的具体对象，更新后价值衰减",
 }
 STYLE_KEYS = [key for key, _ in (
     ("deep_focus", "深度专注:原理、结构、系统分析、长线思考"),

@@ -26,7 +26,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 LIVE_ROOT = Path("E:/otherproject/OpenBiliClaw")
 DEFAULT_VAL = LIVE_ROOT / "data" / "gliner2_training" / "temporal_val.jsonl"
-DEFAULT_ADAPTER = LIVE_ROOT / "data" / "ml_artifacts" / "gliner2_temporal_lora" / "best"
+DEFAULT_ADAPTER = LIVE_ROOT / "data" / "ml_artifacts" / "gliner2_temporal_lora_v4" / "best"
 BASE_MODEL = "fastino/gliner2.5-multi-v1"
 CJK_THRESHOLD = 0.2
 
@@ -52,12 +52,24 @@ def load_val(path: Path) -> list[dict[str, str]]:
     return rows
 
 
-def run_eval(model: Any, rows: list[dict[str, str]], tag: str) -> None:
-    schema_labels = {k: f"{k}: {d}" for k, d in TEMPORAL_DESCRIPTIONS.items()}
+def run_eval(
+    model: Any,
+    rows: list[dict[str, str]],
+    tag: str,
+    *,
+    labels: tuple[str, ...] | None = None,
+) -> None:
+    selected = set(labels) if labels else None
+    schema_labels = {
+        k: f"{k}: {d}" for k, d in TEMPORAL_DESCRIPTIONS.items()
+        if selected is None or k in selected
+    }
     hits = Counter()
     totals = Counter()
     pred_counts: Counter[str] = Counter()
     for row in rows:
+        if selected is not None and row["gold"] not in selected:
+            continue
         use_char = cjk_ratio(row["text"]) >= CJK_THRESHOLD
         model.set_word_splitter("char" if use_char else "whitespace")
         schema = model.create_schema().classification(
@@ -73,11 +85,14 @@ def run_eval(model: Any, rows: list[dict[str, str]], tag: str) -> None:
         hits[f"class:{row['gold']}"] += int(pred == row["gold"])
         pred_counts[pred] += 1
     print(f"[{tag}]")
+    if selected is not None:
+        print(f"  labels: {', '.join(sorted(selected))}")
     for lang in ("all", "zh", "en"):
         n = totals[lang]
         print(f"  {lang:4s} exact {_pct(hits[lang], n)}  ({hits[lang]}/{n})")
     print("  per-class recall:")
-    for cls in sorted(TEMPORAL_CLASSES):
+    classes = sorted(selected) if selected else sorted(TEMPORAL_CLASSES)
+    for cls in classes:
         n = totals[f"class:{cls}"]
         if n:
             print(f"    {cls:11s} {_pct(hits[f'class:{cls}'], n)}  ({n} rows)")
@@ -98,6 +113,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Skip the baseline pass (saves ~half the runtime).",
     )
+    parser.add_argument(
+        "--labels",
+        default="",
+        help="Comma-separated temporal labels to restrict both the schema and "
+        "the evaluated rows to (e.g. versioned,historical,evergreen). "
+        "Empty = all labels.",
+    )
     return parser.parse_args(argv)
 
 
@@ -114,13 +136,22 @@ async def main_async(argv: list[str] | None = None) -> int:
     rows = load_val(val_path)
     print(f"=== GLiNER2 temporal adapter eval ({len(rows)} rows) ===")
 
+    labels: tuple[str, ...] | None = None
+    if str(args.labels or "").strip():
+        labels = tuple(
+            cls
+            for cls in (part.strip() for part in str(args.labels).split(","))
+            if cls in TEMPORAL_CLASSES
+        )
+        print(f"restricting to labels: {', '.join(labels)}")
+
     model = AutoExtractor.from_pretrained(str(args.base_model), map_location="cpu")
     if not args.skip_zero_shot:
-        run_eval(model, rows, "zero-shot")
+        run_eval(model, rows, "zero-shot", labels=labels)
     adapter = args.adapter.expanduser().resolve()
     if adapter.is_dir():
         model.load_adapter(str(adapter))
-        run_eval(model, rows, f"adapter:{adapter.name}")
+        run_eval(model, rows, f"adapter:{adapter.name}", labels=labels)
     else:
         print(f"adapter dir missing ({adapter}); zero-shot only")
     return 0
