@@ -51,6 +51,45 @@ def maybe_subsample(path: Path, max_rows: int, seed: int) -> Path | None:
     return subset
 
 
+def maybe_oversample(
+    path: Path,
+    oversample: list[tuple[str, int]],
+    seed: int,
+) -> Path | None:
+    """Duplicate train rows of the given labels by the given factors.
+
+    Counteracts the heavy class imbalance (versioned / breaking are tiny
+    after the relabel+audit). Pure duplication of exact rows plus a shuffle
+    is intentionally simple; the LoRA has 0.47% trainable params so the
+    per-class repetition is what forces the model to separate the rare
+    labels instead of defaulting to evergreen.
+    """
+
+    if not oversample:
+        return None
+    import json as _json
+
+    factors = dict(oversample)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    out_lines: list[str] = []
+    per_label: dict[str, int] = {}
+    for line in lines:
+        obj = _json.loads(line)
+        entry = obj["output"]["classifications"][0]
+        label = str(entry["true_label"][0] or "")
+        per_label[label] = per_label.get(label, 0) + 1
+        repeat = max(1, int(factors.get(label, 1)))
+        out_lines.extend([line] * repeat)
+    rng = random.Random(seed)
+    rng.shuffle(out_lines)
+    out_path = path.with_name(f"{path.stem}_oversampled.jsonl")
+    out_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+    print(f"  oversample factors    {dict(oversample)}")
+    print(f"  oversampled rows      {len(lines)} -> {len(out_lines)} -> {out_path.name}")
+    print(f"  oversampled dist      {dict(sorted(per_label.items()))}")
+    return out_path
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--train", type=Path, default=DEFAULT_TRAIN)
@@ -65,6 +104,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=0,
         help="Cap training rows for the pilot run; 0 uses the full JSONL.",
+    )
+    parser.add_argument(
+        "--oversample",
+        action="append",
+        default=[],
+        metavar="LABEL:FACTOR",
+        help="Duplicate train rows of LABEL by FACTOR (repeatable, e.g. "
+        "--oversample versioned:5 --oversample breaking:3).",
     )
     parser.add_argument("--lora-r", type=int, default=8)
     parser.add_argument("--encoder-lr", type=float, default=1e-5)
@@ -148,9 +195,24 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     trainer = ExtractorTrainer(model, config)
-    train_data = (
-        maybe_subsample(train_path, int(args.max_train), int(args.seed)) or str(train_path)
-    )
+    oversample: list[tuple[str, int]] = []
+    for spec in args.oversample:
+        if ":" not in str(spec):
+            print(f"  invalid --oversample spec: {spec!r} (need LABEL:FACTOR)")
+            return 1
+        label, _, factor_text = str(spec).partition(":")
+        try:
+            factor = int(factor_text)
+        except ValueError:
+            print(f"  invalid --oversample factor: {spec!r}")
+            return 1
+        if factor < 1:
+            print(f"  invalid --oversample factor: {spec!r}")
+            return 1
+        oversample.append((label.strip(), factor))
+
+    train_data = maybe_oversample(train_path, oversample, int(args.seed)) or str(train_path)
+    train_data = maybe_subsample(Path(train_data), int(args.max_train), int(args.seed)) or train_data
     started = time.monotonic()
     results = trainer.train(train_data=train_data, eval_data=str(val_path))
     elapsed = time.monotonic() - started
