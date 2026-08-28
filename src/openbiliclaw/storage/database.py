@@ -6277,6 +6277,114 @@ class Database:
                 updated += 1
         return updated
 
+    def update_discovery_candidate_temporal_relabel(
+        self,
+        rows: Sequence[Mapping[str, Any]],
+    ) -> int:
+        """Rewrite ONLY the temporal annotation on already-durable candidate rows.
+
+        Sink for the GLiNER2 retraining relabel pass. Unlike the claim-owned
+        evaluation sink (:meth:`_persist_discovery_candidate_evaluation`),
+        these rows live in cached / rejected states, so no ``evaluating``
+        claim is required and relevance, score provenance, status, topic /
+        style / franchise keys, and pool state are never touched.
+
+        The replacement guard mirrors the export washing threshold: a new
+        classified (non-``unknown``), policy-v2, evidence-complete result with
+        ``temporal_confidence >= 0.5`` replaces the old annotation; a neutral,
+        low-confidence, or incomplete result preserves the existing
+        classification instead of erasing it.
+        """
+
+        updated = 0
+        for evaluation in rows:
+            candidate_id = int(evaluation.get("candidate_id") or evaluation.get("id") or 0)
+            if candidate_id <= 0:
+                continue
+            durable_row = self.conn.execute(
+                """
+                SELECT id, published_at, published_label, title, description,
+                       body_text, temporal_class, temporal_confidence,
+                       temporal_reason, temporal_policy_version,
+                       temporal_validity_mode, temporal_valid_until,
+                       temporal_scope, temporal_state, temporal_evidence,
+                       temporal_next_review_at, temporal_evaluated_at,
+                       temporal_evidence_complete
+                FROM discovery_candidates
+                WHERE id = ?
+                LIMIT 1
+                """,
+                (candidate_id,),
+            ).fetchone()
+            if durable_row is None:
+                continue
+            durable = dict(durable_row)
+            candidate_content_text = {
+                "title": durable.get("title", ""),
+                # Candidate evaluation uses the batch prompt, whose description
+                # projection is capped at 400 characters. The relabel sink must
+                # not ground against text the model never saw.
+                "description": str(durable.get("description", "") or "")[:400],
+                "body_text": durable.get("body_text", ""),
+                "published_label": durable.get("published_label", ""),
+            }
+            incoming_temporal, incoming_lifecycle = (
+                _normalize_temporal_evidence_group_for_storage(
+                    evaluation,
+                    content_text=candidate_content_text,
+                )
+            )
+            existing_temporal, _existing_lifecycle = (
+                _normalize_temporal_evidence_group_for_storage(durable)
+            )
+            existing_is_classified = existing_temporal[0] != "unknown"
+            incoming_can_replace = (
+                incoming_temporal[3] == TEMPORAL_POLICY_VERSION
+                and incoming_temporal[0] != "unknown"
+                and float(incoming_temporal[1] or 0.0) >= 0.5
+                and bool(incoming_lifecycle[7])
+            )
+            if incoming_can_replace or not existing_is_classified:
+                temporal = incoming_temporal
+                lifecycle = incoming_lifecycle
+            else:
+                # A low-confidence / neutral / incomplete re-label must not
+                # erase an older classified annotation.
+                temporal = existing_temporal
+                lifecycle = _temporal_lifecycle_group_for_storage(durable)
+            cursor = self.conn.execute(
+                """
+                UPDATE discovery_candidates
+                SET temporal_class = ?, temporal_confidence = ?,
+                    temporal_reason = ?, temporal_policy_version = ?,
+                    temporal_validity_mode = ?, temporal_valid_until = ?,
+                    temporal_scope = ?, temporal_state = ?,
+                    temporal_evidence = ?, temporal_next_review_at = ?,
+                    temporal_evaluated_at = ?, temporal_evidence_complete = ?
+                WHERE id = ?
+                """,
+                (
+                    temporal[0],
+                    temporal[1],
+                    temporal[2],
+                    temporal[3],
+                    lifecycle[0],
+                    lifecycle[1],
+                    lifecycle[2],
+                    lifecycle[3],
+                    lifecycle[4],
+                    lifecycle[5],
+                    lifecycle[6],
+                    lifecycle[7],
+                    candidate_id,
+                ),
+            )
+            if cursor.rowcount:
+                updated += 1
+        if updated:
+            self.conn.commit()
+        return updated
+
     def update_discovery_candidate_tag_channel(
         self,
         rows: Sequence[Mapping[str, Any]],
