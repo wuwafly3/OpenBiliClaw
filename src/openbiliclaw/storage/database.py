@@ -60,6 +60,10 @@ from openbiliclaw.discovery.temporal import (
     schedule_temporal_evaluation,
 )
 from openbiliclaw.published_time import normalize_published_time
+from openbiliclaw.recommendation.weight_policy import (
+    MAX_WEIGHT_LEVEL,
+    RECOMMENDATION_WEIGHT_DIMENSION_SET,
+)
 from openbiliclaw.saved_sync.identity import (
     canonical_source_platform,
     content_storage_key,
@@ -1226,6 +1230,36 @@ CREATE TABLE IF NOT EXISTS recommendations (
     presented_at TIMESTAMP,
     feedback_at TIMESTAMP,
     FOREIGN KEY (bvid) REFERENCES content_cache(bvid)
+);
+
+-- LLM-adjustable recommendation scoring policy. The model never writes a
+-- coefficient: it can only advance one of five server-owned 0..3 ladders.
+CREATE TABLE IF NOT EXISTS recommendation_weight_policy (
+    singleton              INTEGER PRIMARY KEY CHECK (singleton = 1),
+    relevance_level        INTEGER NOT NULL DEFAULT 0 CHECK (relevance_level BETWEEN 0 AND 3),
+    freshness_level        INTEGER NOT NULL DEFAULT 0 CHECK (freshness_level BETWEEN 0 AND 3),
+    topic_fatigue_level    INTEGER NOT NULL DEFAULT 0 CHECK (topic_fatigue_level BETWEEN 0 AND 3),
+    source_monotony_level  INTEGER NOT NULL DEFAULT 0 CHECK (source_monotony_level BETWEEN 0 AND 3),
+    serendipity_level      INTEGER NOT NULL DEFAULT 0 CHECK (serendipity_level BETWEEN 0 AND 3),
+    policy_revision        INTEGER NOT NULL DEFAULT 0,
+    updated_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- One immutable receipt per dialogue turn makes retries idempotent and keeps
+-- the user feedback and LLM rationale available for local audit.
+CREATE TABLE IF NOT EXISTS recommendation_weight_adjustments (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id        TEXT NOT NULL UNIQUE,
+    dimension         TEXT NOT NULL CHECK (
+        dimension IN ('relevance', 'freshness', 'topic_fatigue',
+                      'source_monotony', 'serendipity')
+    ),
+    previous_level    INTEGER NOT NULL CHECK (previous_level BETWEEN 0 AND 3),
+    new_level         INTEGER NOT NULL CHECK (new_level BETWEEN 0 AND 3),
+    status            TEXT NOT NULL CHECK (status IN ('applied', 'at_limit')),
+    feedback_excerpt  TEXT NOT NULL,
+    reason            TEXT NOT NULL,
+    created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Recommendation impression ledger (ML ranking Wave 0).
@@ -11074,6 +11108,187 @@ class Database:
                     raise
                 attempts -= 1
                 time.sleep(_LOCK_RETRY_SLEEP_SECONDS)
+
+    def get_recommendation_weight_policy(self) -> dict[str, Any]:
+        """Return the singleton step policy, defaulting to an untouched formula."""
+        # Curator scoring runs in a serve worker. A facade-owned thread
+        # connection would stay registered until Database.close(), which keeps
+        # temporary SQLite files open on Windows. This tiny policy read owns and
+        # closes its connection instead.
+        conn = self.open_connection()
+        try:
+            row = conn.execute(
+                """
+                SELECT relevance_level, freshness_level, topic_fatigue_level,
+                       source_monotony_level, serendipity_level,
+                       policy_revision, updated_at
+                FROM recommendation_weight_policy
+                WHERE singleton = 1
+                """
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is not None:
+            return dict(row)
+        return {
+            "relevance_level": 0,
+            "freshness_level": 0,
+            "topic_fatigue_level": 0,
+            "source_monotony_level": 0,
+            "serendipity_level": 0,
+            "policy_revision": 0,
+            "updated_at": "",
+        }
+
+    @staticmethod
+    def _recommendation_weight_audit_text(
+        value: object,
+        *,
+        field_name: str,
+        max_length: int,
+    ) -> str:
+        """Normalize a bounded local audit field and reject hidden controls."""
+        normalized = " ".join(str(value or "").split())
+        if (
+            not normalized
+            or len(normalized) > max_length
+            or any(unicodedata.category(char).startswith("C") for char in normalized)
+        ):
+            raise ValueError(f"recommendation weight {field_name} is invalid")
+        return normalized
+
+    def raise_recommendation_weight_level(
+        self,
+        *,
+        dimension: str,
+        request_id: str,
+        feedback_excerpt: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Atomically advance one bounded ladder level for one dialogue turn.
+
+        ``request_id`` is server-owned and unique, so an HTTP or LLM retry can
+        never apply the same feedback twice. A conflicting dimension for an
+        already-consumed request is reported without changing either policy.
+        """
+        normalized_dimension = str(dimension).strip()
+        if normalized_dimension not in RECOMMENDATION_WEIGHT_DIMENSION_SET:
+            raise ValueError("unsupported recommendation weight dimension")
+        normalized_request_id = self._recommendation_weight_audit_text(
+            request_id,
+            field_name="request_id",
+            max_length=400,
+        )
+        normalized_feedback = self._recommendation_weight_audit_text(
+            feedback_excerpt,
+            field_name="feedback_excerpt",
+            max_length=400,
+        )
+        normalized_reason = self._recommendation_weight_audit_text(
+            reason,
+            field_name="reason",
+            max_length=240,
+        )
+        level_column = f"{normalized_dimension}_level"
+
+        conn = self.open_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                """
+                SELECT dimension, previous_level, new_level, status
+                FROM recommendation_weight_adjustments
+                WHERE request_id = ?
+                """,
+                (normalized_request_id,),
+            ).fetchone()
+            if existing is not None:
+                conn.rollback()
+                existing_dimension = str(existing["dimension"])
+                return {
+                    "status": (
+                        "duplicate" if existing_dimension == normalized_dimension else "conflict"
+                    ),
+                    "dimension": existing_dimension,
+                    "previous_level": int(existing["previous_level"]),
+                    "new_level": int(existing["new_level"]),
+                    "original_status": str(existing["status"]),
+                }
+
+            conn.execute(
+                "INSERT OR IGNORE INTO recommendation_weight_policy (singleton) VALUES (1)"
+            )
+            policy = conn.execute(
+                f"SELECT {level_column}, policy_revision "
+                "FROM recommendation_weight_policy WHERE singleton = 1"
+            ).fetchone()
+            if policy is None:  # pragma: no cover - INSERT and same transaction guarantee it
+                raise RuntimeError("recommendation weight policy row is missing")
+            previous_level = int(policy[level_column])
+            new_level = min(MAX_WEIGHT_LEVEL, previous_level + 1)
+            status = "applied" if new_level > previous_level else "at_limit"
+            if status == "applied":
+                conn.execute(
+                    f"""
+                    UPDATE recommendation_weight_policy
+                    SET {level_column} = ?,
+                        policy_revision = policy_revision + 1,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE singleton = 1
+                    """,
+                    (new_level,),
+                )
+            conn.execute(
+                """
+                INSERT INTO recommendation_weight_adjustments (
+                    request_id, dimension, previous_level, new_level,
+                    status, feedback_excerpt, reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    normalized_request_id,
+                    normalized_dimension,
+                    previous_level,
+                    new_level,
+                    status,
+                    normalized_feedback,
+                    normalized_reason,
+                ),
+            )
+            revision_row = conn.execute(
+                "SELECT policy_revision FROM recommendation_weight_policy WHERE singleton = 1"
+            ).fetchone()
+            conn.commit()
+            return {
+                "status": status,
+                "dimension": normalized_dimension,
+                "previous_level": previous_level,
+                "new_level": new_level,
+                "policy_revision": int(revision_row["policy_revision"]),
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def list_recommendation_weight_adjustments(
+        self,
+        *,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Return recent local audit receipts, newest first."""
+        rows = self.conn.execute(
+            """
+            SELECT request_id, dimension, previous_level, new_level,
+                   status, feedback_excerpt, reason, created_at
+            FROM recommendation_weight_adjustments
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (max(0, min(500, int(limit))),),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def get_recent_recommendation_signals(self, *, limit: int = 30) -> list[dict[str, Any]]:
         """Return recent recommendations with topic/source for scoring context.

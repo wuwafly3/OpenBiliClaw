@@ -28,6 +28,7 @@ runtime 使用公开 `drain_pending_expression_copy(profile, limit<=60, max_extr
 | 候选排序统一 | ✅ | freshly discovered 与 cache backfill 现在共享同一套 tier / relevance / recency 排序口径 |
 | 9.1 反馈处理 | ✅ | CLI、本地 API、插件 popup 与移动 Web 已统一写回推荐反馈与 `feedback` 事件；推荐点击会携带 `content_id / content_url / source_platform`，跨源内容不会被记成 B 站点击；推荐反馈事件同样保留候选真实 `source_platform`，旧记录缺来源时兼容回退 `bilibili` |
 | 9.2 画像更新 | ✅ | 反馈累计到阈值后会自动触发偏好层重分析与画像重建 |
+| 对话反馈阶梯调权 | ✅ | `raise_recommendation_weight` 只接受五个已有维度之一；一次对话最多提高 1 阶，每维最多 3 阶。每阶为归一化前 `+5%`，归一化后总权重仍为 1；LLM 不能提交数值权重或替换公式。调权绑定服务端 `turn_id` 幂等落库，单张卡片 like/dislike 不触发 |
 | Bangumi 目录卡片 | ✅ | 推荐与惊喜 DTO 透传 `rating_score / rating_count / source_rank`；桌面、移动与扩展统一显示评分、评分人数和排名，且不把目录评分冒充点赞/评论 |
 | 微博文字卡与真实互动 | ✅ | `source_platform="weibo"` / `content_type="post"` 使用无封面文字卡；DTO 透传真实 `reads_count → view_count`、点赞、评论和 `reposts_count → share_count`。没有 favorite / danmaku 字段时保持 0 并隐藏，不用热搜热度或转发数冒充阅读量 |
 | Issue #91 卡片反馈双轴匹配 | ✅ | 卡片 like/dislike 会在 Pool Curator 中同时匹配候选的细粒度 `topic_key` 与粗粒度 `topic_group`；任一轴命中即施加一次软调整，两轴同时命中不会重复加权 |
@@ -431,13 +432,35 @@ from openbiliclaw.recommendation.curator import PoolCurator
 
 #### ScoringWeights
 
-| 维度 | 权重 |
+下表是未调节时的基线：
+
+| 维度 | 基线权重 |
 |------|------|
 | `relevance` | 0.30 |
 | `freshness` | 0.10 |
 | `topic_fatigue` | 0.25 |
 | `source_monotony` | 0.15 |
 | `serendipity` | 0.20 |
+
+对话中的整体排序反馈可以让 LLM 调用 `raise_recommendation_weight`。模型只能选择
+`relevance / freshness / topic_fatigue / source_monotony / serendipity` 之一，不能传入
+新公式、系数或步数。后端按以下固定规则计算：
+
+```text
+raw_i       = baseline_i × (1 + 0.05 × level_i)
+effective_i = raw_i × (Σ baseline / Σ raw)
+level_i     ∈ {0, 1, 2, 3}
+```
+
+因此每次调用只升一阶，单维最多在归一化前提高 15%，总权重尺度保持不变。第一个
+安全刻度按 2026-08-30 的保守边界设定，小于既有单卡反馈 `0.05–0.20` 的加减分；更换
+评估模型、embedding 模型或评分维度后，需要用排序/反馈 A/B 数据重新校准。
+
+工具只用于用户明确评价“整体推荐”时：不够相关→`relevance`，内容普遍太旧→
+`freshness`，同主题反复出现→`topic_fatigue`，来源过于单一→`source_monotony`，推荐
+太保守→`serendipity`。普通卡片 like/dislike 继续走既有软反馈，不会自动改全局权重。
+服务端把真实对话 `turn_id` 与有界原始反馈摘录绑定到本地审计行；同一 turn 重试不重复生效，
+同一 turn 改投其它维度会被拒绝。
 
 `serendipity` 加分只对 `explore` 来源发放（满额 1.0）。其余任何 strategy —— 包括 `trending` —— 一律为 0.0：来源只是上下文，不能凭发现路径白拿 rec_score（issue #90）。
 
@@ -503,6 +526,18 @@ from openbiliclaw.recommendation.curator import PoolCurator
 #### 公开 API
 
 ```python
+# 读取当前阶梯，并计算本轮实际权重
+from openbiliclaw.recommendation.weight_policy import (
+    RecommendationWeightPolicy,
+    ScoringWeights,
+    effective_scoring_weights,
+)
+
+policy = RecommendationWeightPolicy.from_mapping(
+    db.get_recommendation_weight_policy()
+)
+weights = effective_scoring_weights(ScoringWeights(), policy)
+
 # 从当前数据库状态构建评分上下文
 context: ScoringContext = curator.build_context()
 
@@ -516,6 +551,12 @@ curator.record_temporal_ranking_shadow_audit(candidates, scores, context)
 # 检查候选池健康状态
 report: PoolHealthReport = curator.check_pool_health()
 ```
+
+API runtime 还会把 `RECOMMENDATION_TOOLS` 与 `RecommendationToolDispatcher` 注册到
+`SocraticDialogue`。模型只返回公开的 `dimension/reason`；下划线字段
+`_request_id/_user_message` 由对话服务在模型返回后补入，不能交给模型生成。
+`PoolCurator.build_context*()` 把当时的有效权重冻结在 `ScoringContext.weights`，保证一次
+候选评分与对应 temporal shadow 使用同一 policy revision。
 
 `score_candidates()` 以叠加覆盖层的形式返回新的分数映射，不会修改传入的候选对象。`PoolCurator` 的所有方法均不修改输入数据。shadow 的年龄桶固定为 `<=1d / 1-7d / 7-30d / 30-180d / >180d / unknown`，用于与 2026-08 历史回放口径连续比较；它只回答“bonus 改了谁的相对位置”，本身不改变 eligibility 或自动调整硬期限。
 

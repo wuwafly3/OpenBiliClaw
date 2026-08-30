@@ -50,6 +50,21 @@ class DialogueLearningConfigurationError(RuntimeError):
     """Raised when queued dialogue learning has no settlement queue."""
 
 
+class CompositeToolDispatcher:
+    """Route each whitelisted dialogue tool name to its owning dispatcher."""
+
+    def __init__(self, routes: dict[str, Any]) -> None:
+        self._routes = dict(routes)
+
+    def dispatch(self, tool_call: dict[str, Any]) -> str:
+        """Dispatch without letting one business owner catch another's name."""
+        name = str(tool_call.get("name", ""))
+        dispatcher = self._routes.get(name)
+        if dispatcher is None:
+            return f"未知工具: {name}"
+        return str(dispatcher.dispatch(tool_call))
+
+
 def _default_turn_timestamp() -> str:
     return datetime.now().astimezone().isoformat()
 
@@ -234,7 +249,12 @@ class SocraticDialogue:
 
                 # If tools are configured, try tool-calling path first
                 if self._tools and self._tool_dispatcher:
-                    reply = await self._respond_with_tools(service, prompt_user_message)
+                    reply = await self._respond_with_tools(
+                        service,
+                        prompt_user_message,
+                        request_id=turn_id,
+                        feedback_message=user_message,
+                    )
                 else:
                     response = await service.complete_socratic_dialogue(
                         user_message=prompt_user_message,
@@ -320,7 +340,14 @@ class SocraticDialogue:
                     asyncio.create_task(_background_learn())
             return reply
 
-    async def _respond_with_tools(self, service: Any, user_message: str) -> str:
+    async def _respond_with_tools(
+        self,
+        service: Any,
+        user_message: str,
+        *,
+        request_id: str,
+        feedback_message: str,
+    ) -> str:
         """Attempt a tool-calling response, falling back to normal dialogue.
 
         The flow:
@@ -362,7 +389,12 @@ class SocraticDialogue:
             logger.info("Dialogue tool call: %s", tool_call.get("name"))
             if self._tool_dispatcher is None:
                 return str(response.content)
-            tool_result = self._tool_dispatcher.dispatch(tool_call)
+            server_tool_call = dict(tool_call)
+            # These fields come from the durable request boundary, not from the
+            # model. They make mutation idempotent and bind it to real feedback.
+            server_tool_call["_request_id"] = request_id
+            server_tool_call["_user_message"] = feedback_message
+            tool_result = self._tool_dispatcher.dispatch(server_tool_call)
 
             # Feed tool result back to get a natural reply
             followup = await service.complete_socratic_dialogue(

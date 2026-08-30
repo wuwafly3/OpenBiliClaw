@@ -21,6 +21,11 @@ from openbiliclaw.discovery.temporal import (
     temporal_bonus_component,
     trusted_publication_datetime,
 )
+from openbiliclaw.recommendation.weight_policy import (
+    RecommendationWeightPolicy,
+    ScoringWeights,
+    effective_scoring_weights,
+)
 
 if TYPE_CHECKING:
     from openbiliclaw.discovery.engine import DiscoveredContent
@@ -33,33 +38,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Immutable configuration & context
 # ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class ScoringWeights:
-    """Tuneable weights for the composite rec_score.
-
-    Serendipity is weighted higher (0.20) to ensure cross-domain explore
-    content surfaces in recommendations, not just high-relevance safe picks.
-
-    ``topic_fatigue`` was raised from 0.15 to 0.25 after observing that
-    high-relevance candidates for "洛克王国"/"动漫"/etc. kept winning the
-    top-K reshuffle batches because the per-key fatigue penalty (~0.045)
-    couldn't overcome the relevance weight advantage (~0.28). Combined
-    with the steeper fatigue curve (now ``count^1.5/len*5``) and the new
-    topic_group axis, the same candidate now takes a 3-4x harder hit
-    when it has appeared ≥2 times in recent history.
-
-    ``freshness`` is retained as a compatibility-friendly name, but now
-    weights a positive publication-time bonus.  It never represents cache
-    insertion or evaluation recency.
-    """
-
-    relevance: float = 0.30
-    freshness: float = 0.10
-    topic_fatigue: float = 0.25
-    source_monotony: float = 0.15
-    serendipity: float = 0.20
 
 
 @dataclass(frozen=True)
@@ -89,6 +67,7 @@ class ScoringContext:
     newly_confirmed_amplification_keys: frozenset[str] = field(default_factory=frozenset)
     over_budget_amplification_keys: frozenset[str] = field(default_factory=frozenset)
     now: datetime = field(default_factory=lambda: datetime.now(UTC))
+    weights: ScoringWeights | None = None
 
 
 @dataclass(frozen=True)
@@ -358,7 +337,22 @@ class PoolCurator:
             ),
             newly_confirmed_amplification_keys=normalized_amplification_keys,
             over_budget_amplification_keys=frozenset(over_budget_keys),
+            weights=self.effective_weights(),
         )
+
+    def effective_weights(self) -> ScoringWeights:
+        """Return the current bounded policy overlay on the configured weights."""
+        reader = getattr(self._database, "get_recommendation_weight_policy", None)
+        if not callable(reader):
+            return self._weights
+        try:
+            policy = RecommendationWeightPolicy.from_mapping(reader())
+        except Exception:
+            logger.warning(
+                "recommendation weight policy read failed; using baseline", exc_info=True
+            )
+            return self._weights
+        return effective_scoring_weights(self._weights, policy)
 
     def score_candidates(
         self,
@@ -370,7 +364,7 @@ class PoolCurator:
         The returned dict can be passed as ``score_override`` to the
         engine's diversified batch selector.
         """
-        w = self._weights
+        w = context.weights or self.effective_weights()
         scores: dict[str, float] = {}
         for item in candidates:
             base = item.relevance_score * w.relevance
@@ -423,6 +417,7 @@ class PoolCurator:
         classes: dict[str, str] = {}
         sources: dict[str, str] = {}
         ages: dict[str, str] = {}
+        weights = context.weights or self.effective_weights()
         for identity, item in items_by_id.items():
             raw_score = scores.get(identity, 0.0)
             try:
@@ -431,9 +426,7 @@ class PoolCurator:
                 score = 0.0
             if not math.isfinite(score):
                 score = 0.0
-            temporal_bonus = (
-                self._temporal_bonus_component(item, context.now) * self._weights.freshness
-            )
+            temporal_bonus = self._temporal_bonus_component(item, context.now) * weights.freshness
             published = self._publication_datetime(item, context.now)
             effective_scores[identity] = max(0.0, score)
             baseline_scores[identity] = max(0.0, score - temporal_bonus)
@@ -714,7 +707,7 @@ class PoolCurator:
         Uses embedding cosine similarity instead of exact string match for
         topic_fatigue and feedback_adjustment when embedding_service is available.
         """
-        w = self._weights
+        w = context.weights or self.effective_weights()
         scores: dict[str, float] = {}
 
         # Pre-embed recent topics and feedback topics for reuse

@@ -43,6 +43,8 @@ interest updates: HTTP/source event → durable commit + wake (no pipeline/LLM w
                   │                                               → owner tick_if_buffered → INTEREST
                   │  periodic profile maintenance only → tick
                   └─ dialogue → typed settlement worker → learning
+                       └─ explicit feed-wide ranking feedback → bounded one-step weight tool
+                            → SQLite policy/audit → next PoolCurator context
                   legacy feedback batch retired; unified_interest_line=false is rollback only
 
 dislike output boundary:
@@ -295,7 +297,7 @@ Web durable turn 只在成功 completion CAS 后交接认知与成功事件；�
 - 推荐、delight 与保存列表出口共享 `item_key / content_id / source_platform / content_url / content_type` 身份契约；`content_cache.item_key` 对非空 canonical identity 使用 partial unique index，并用独立普通索引支持 lookup，`recommendations.item_key` 引用同一 identity。插件 side panel、桌面 Web 与移动 Web 的卡片先 POST `/api/saved/{list_kind}`，保存页再用 `/sync` + durable task poll 做显式平台写入；默认关闭的 `saved_sync.auto_sync_enabled` 只决定本地保存后是否创建后台任务。手动同步对当前 adapter 支持且未处于已同步 / 同步中的项始终可用；仅 `unsupported_adapter_missing` 可在 adapter 注册后重新进入单项/批量快照，`unsupported_content_type` 等真实能力限制继续显示为仅本地保存。本地 `/remove` 永不反向删除平台记录。
 - `/api/feedback` 的 event ledger 与 recommendation 展示字段不是跨表原子写：先按 `request_id` commit durable feedback event，再以独立 commit 更新 recommendation projection。第二步失败时响应失败；同 `request_id` 重试会命中 duplicate event、核对 durable payload 后重做 projection，修复 commit gap；冲突 payload 返回 409。画像学习由上述 content-feedback durable consumer 异步领取，不扩大 HTTP 成功边界。
 - `/api/recommendation-click` 会保留 `content_id / content_url / source_platform`：插件、移动 Web 或桌面 Web 打开推荐内容后，后端把点击写成对应来源的统一事件和 `recommendation_click` 强画像信号；只传 `recommendation_id` 时会从 `recommendations + content_cache` 回填跨源字段，避免 YouTube / 抖音等 ID 被套成 B 站 URL。
-- `PoolCurator` 五维评分（relevance · publication temporal bonus · topic_fatigue · source_monotony · serendipity）；第二维只奖励发布时间明确且高置信的 `breaking/current/versioned`，常青、历史、未知或缺时间内容为中性，完全不读取 `discovered_at`。三态 temporal eligibility 独立于评分：年龄只能触发复审，grounded deadline / terminal state 才能 hard expire；它与 bonus 共用 `discovery.temporal` 的类别策略、置信门和时间解析。每次评分 best-effort 写入 aggregate-only Top10/50/100 no-bonus shadow，观察排序 churn 与 class/source/age 偏移，不改变 eligibility、分数、MMR 或 serving
+- `PoolCurator` 五维评分（relevance · publication temporal bonus · topic_fatigue · source_monotony · serendipity）；第二维只奖励发布时间明确且高置信的 `breaking/current/versioned`，常青、历史、未知或缺时间内容为中性，完全不读取 `discovered_at`。三态 temporal eligibility 独立于评分：年龄只能触发复审，grounded deadline / terminal state 才能 hard expire；它与 bonus 共用 `discovery.temporal` 的类别策略、置信门和时间解析。API dialogue 还注册受限 `raise_recommendation_weight`：LLM 只能按用户明确的整体排序反馈选择一个已有维度，服务端每次升一阶、每维最多三阶、每阶 raw `+5%` 后重新归一化；真实 `turn_id` 使 SQLite policy/audit 原子幂等，单卡反馈不触发。每次评分把有效权重冻结进 context，并 best-effort 写入 aggregate-only Top10/50/100 no-bonus shadow，观察排序 churn 与 class/source/age 偏移，不改变 eligibility、MMR 或 serving 边界
 - v0.3.1 双轴 fatigue：`recent_topic_keys` (细) + `recent_topic_groups` (粗) 取 max；曲线 `count^1.5/len*5`，count=2 即触发 0.47 强抑制
 - 新兴趣 amplification guard：刚确认的探针兴趣会用 domain/specific/topic key 形成 guard，`PoolCurator` 做 24h rolling budget 软降权，最终批选择做 `max(1, floor(limit*0.25))` 硬上限
 - `_merge_topic_supergroups` — serve 时基于 embedding 把 `动漫杂谈/补番/解说` 等近义 topic 合并为同一聚类

@@ -427,6 +427,7 @@ trusted LAN ─ HTTPS（可选）──→ TLS Proxy :8443 ─ loopback/Compose 
 │  │首启 fence+task admission→listener；后台 owner→tick_if_buffered│ │
 │  │热重载 pause/drain/recover→rebind；周期画像维护→tick       │   │
 │  │对话 → typed settlement worker → learning；旧反馈批仅 false 回退│ │
+│  │整体排序反馈 → LLM 单维 tool → 0..3 阶（每阶5%）→ 归一化权重│ │
 │  └──────────────────────────────────────────────────────┘   │
 │  ┌──────────────────────────────────────────────────────┐   │
 │  │ delight / interest.probe / avoidance.probe 主动推送（含probe_mode）│ │
@@ -496,6 +497,7 @@ trusted LAN ─ HTTPS（可选）──→ TLS Proxy :8443 ─ loopback/Compose 
 │  └──────────────┘ └──────────────┘ └────────────────┘      │
 │  ┌──────────────────────────────────────────────────────┐   │
 │  │     PoolCurator + 双轴 fatigue + per-group 窗口 + 新兴趣放大保护 │ │
+│  │     对话调权：单 turn 幂等审计 + 单维单阶 + 3 阶上限 + 总权重归一化 │ │
 │  │     request_replenishment + 定时/手动补货 + B/XHS/DY/YT/X/Zhihu/Reddit/Linux.do/Bangumi=5/1/1/1/1/1/1/1/1 │ │
 │  │     request_replenishment + 定时/手动补货 + B/XHS/DY/YT/X/Zhihu/Reddit/Bangumi/V2EX=5/1/1/1/1/1/1/1/1 │ │
 │  │     raw断供 → 欠份额 producer 即时并行唤醒 → 真实新增计数 / 无产出阶梯退避 │ │

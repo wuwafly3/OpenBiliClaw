@@ -683,6 +683,7 @@ Agent 宿主（OpenClaw / Hermes / WorkBuddy）
 │ 首启 fence+task admission → listener；后台 owner recovery → tick_if_buffered │
 │ 热重载 pause/drain/recover 后 rebind；周期画像维护才调用 tick │
 │ 对话 → typed settlement worker → learning          │
+│ 整体排序反馈 → LLM 单维调权工具 → 0..3 阶（每阶 5%）→ 归一化 PoolCurator 权重 │
 │ 旧反馈批：unified_interest_line=false 时启用   │
 │ 初始化屏障：完整画像落盘 → 发现/评估/表达 → 可浏览推荐 │
 │ B站供给：普通相关性搜索 + 预算内 1×5 pubdate recent lane → 统一评估 │

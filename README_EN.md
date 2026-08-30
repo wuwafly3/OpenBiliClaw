@@ -680,6 +680,7 @@ images: proxy foreground + refresh prefetch → app-stable lane (total 4 / bg 3,
 │ cold start fence+task admission → listener; background recovery → tick_if_buffered │
 │ hot reload pause/drain/recover then rebind; periodic maintenance alone calls tick │
 │ Dialogue → typed settlement worker → learning       │
+│ Feed-wide ranking feedback → one LLM weight tool → 0..3 levels (5% each) → normalized PoolCurator weights │
 │ Legacy batch only when rollback flag=false     │
 │ Init barrier: profile commit → discover/evaluate/copy → ready │
 │ Bilibili supply: relevance search + budgeted 1×5 pubdate recent lane → shared evaluation │

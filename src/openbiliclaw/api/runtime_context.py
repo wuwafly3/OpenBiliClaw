@@ -1619,12 +1619,24 @@ class RuntimeContext:
             x_health_store=account_sync_x_health,
         )
 
-        # 10. Dialogue (with source management tools) + one settlement queue
-        from openbiliclaw.soul.dialogue import DialogueLearningMode
+        # 10. Dialogue (with source and bounded recommendation tools) + one settlement queue
+        from openbiliclaw.recommendation.tools import (
+            RECOMMENDATION_TOOL_NAMES,
+            RECOMMENDATION_TOOLS,
+            RecommendationToolDispatcher,
+        )
+        from openbiliclaw.soul.dialogue import CompositeToolDispatcher, DialogueLearningMode
         from openbiliclaw.soul.dialogue_learn_queue import DialogueSettlementQueue
         from openbiliclaw.sources.tools import SOURCE_TOOLS, SourceToolDispatcher
 
         source_tool_dispatcher = SourceToolDispatcher(self.database)
+        recommendation_tool_dispatcher = RecommendationToolDispatcher(self.database)
+        dialogue_tool_dispatcher = CompositeToolDispatcher(
+            {
+                **{str(tool["name"]): source_tool_dispatcher for tool in SOURCE_TOOLS},
+                **{name: recommendation_tool_dispatcher for name in RECOMMENDATION_TOOL_NAMES},
+            }
+        )
         anchor_manager = getattr(new_soul_engine, "_dialogue_anchor_manager", None)
         anchor_provider = getattr(anchor_manager, "snapshot", None)
         new_settlement_queue = DialogueSettlementQueue(
@@ -1647,8 +1659,8 @@ class RuntimeContext:
             soul_engine=new_soul_engine,
             llm_service=new_llm_service,
             session="popup",
-            tools=SOURCE_TOOLS,
-            tool_dispatcher=source_tool_dispatcher,
+            tools=[*SOURCE_TOOLS, *RECOMMENDATION_TOOLS],
+            tool_dispatcher=dialogue_tool_dispatcher,
             database=self.database,
             learning_mode=DialogueLearningMode.QUEUED,
             settlement_queue=new_settlement_queue,

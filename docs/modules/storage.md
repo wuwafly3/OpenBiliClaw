@@ -9,7 +9,7 @@
 - 行为、推荐、候选池、聊天和鉴权状态的 SQLite 表结构管理。
 - 推荐池 `content_cache` 的可换 / raw / pending 计数口径。
 - discovery 待评估池 `discovery_candidates` 的生命周期管理。
-- evaluator prefilter、推荐时效排序的 privacy-safe shadow 审计，以及正式推荐池的时效 eligibility 持久化守卫。
+- evaluator prefilter、推荐时效排序的 privacy-safe shadow 审计、LLM 阶梯调权策略与幂等审计，以及正式推荐池的时效 eligibility 持久化守卫。
 - 跨平台收藏 / 稍后再看的 canonical 本地 membership、元数据快照、native sync 状态和独立任务快照持久化。
 - 事件入口幂等回执，以及小红书 / 抖音 / YouTube / 知乎 / Reddit / Linux.do 来源任务首个终态结果的 crash-safe staging。
 - 事件入口幂等回执，以及小红书 / 抖音 / YouTube / 知乎 / Reddit 来源任务首个终态结果的 crash-safe staging。
@@ -104,6 +104,7 @@
 | discovery 待评估池 | ✅ | `discovery_candidates` 支持 mixed-source enqueue / claim / evaluation / admission，并持久化 `claim_token`、`score_threshold`、`eval_attempts` 与 batch 级 `batch_eval_attempts`；stale-sensitive 完成和释放都匹配 `id + status + claim_token`。 |
 | evaluator prefilter shadow 审计 | ✅ | `evaluator_prefilter_shadow_audit` 用随机 decision id 连接预过滤决策与最终原始 LLM score / admission 结果；只保存 identity hash、类别、数值和 digest，不保存标题、URL、正文、prompt、画像文本或 provider response。每次 insert 同时执行 30 天和 20,000 行双重 retention；任何写入/回填失败由 discovery fail-open，并以 incomplete telemetry 阻断 enforce gate。 |
 | 推荐时效排序 shadow 审计 | ✅ | `temporal_ranking_shadow_audit` 只保存一次候选窗口的总数、时间覆盖、bonus 资格数，以及 class/source/age bucket 和 Top10/50/100 before/after 聚合；不保存任何候选 identity 或内容文本。每次写入执行 30 天 / 5,000 行双重 retention，失败不影响推荐。 |
+| 推荐权重阶梯与审计 | ✅ | `recommendation_weight_policy` 保存五个 `0..3` level 与 revision；`recommendation_weight_adjustments` 以唯一服务端 `request_id` 保存维度、前后阶、结果、原始反馈摘录和模型理由。`BEGIN IMMEDIATE` 原子完成查重与单阶提升；重复返回 `duplicate`，同 request 换维度返回 `conflict`，到顶记录 `at_limit` 但不增加 revision。 |
 | 推荐池 temporal v2 三态 | ✅ | discovery admission、canonical pool 读取、等待扫描、snapshot 清退与最终 serve 写事务共用 `discovery.temporal` 的 `eligible/review_due/expired` 纯策略。只有置信度 `>=0.80`、完整、`scope=core`、逐字 grounded 的明确 deadline 已过或 `state=expired/superseded` 才 hard expire；1 / 14 / 120 天及旧 v1 3 / 60 天只触发复审。`review_due` discovery 行回到 `pending_eval`，已入池行进入 `pool_status='temporal_review_hold'`；`expired` 行才进入 `rejected_temporal_stale` / `stale`。单次生命周期清扫最多持久化 500 条，但所有 canonical 读取和计数先排除整批 review-due / expired 行。 |
 | 时效展示与 backfill 防绕过 | ✅ | `get_recommendations(exclude_processed=True)`、未读计数与主动通知在最终 limit 前过滤后来进入 `review_due/expired` 的历史推荐，默认历史读取保持完整；`get_unrecommended_content()` 只返回 fresh/non-dislike/temporal-eligible 行。cached-backfill 完整往返证据组，普通 raw 重抓、旧缓存、`unknown/0` 或 malformed 结果不能局部洗字段，也不能把 hold/stale 行复活。readiness、pending-copy、topic/franchise/source 统计与 delight count/backlog 同样排除 `temporal_review_hold` / temporal stale，不让不可展示库存继续占配额或计算预算。 |
 | discovery 历史候选查询 | ✅ | `get_existing_discovery_candidate_keys()` 与 `get_existing_content_cache_ids()` 支持 pipeline 在 enqueue 前过滤历史候选和已缓存内容，避免重复 raw 占住 Evo 前供给窗口。 |
@@ -131,6 +132,23 @@ fresh servable pool predicate，并可按 embedding fingerprint、正维度和 s
 增量补列，旧的无 provenance 行不会被当作当前 embedding namespace 的完成结果。
 
 ## 公开 API
+
+### 推荐权重阶梯与审计
+
+```python
+policy = db.get_recommendation_weight_policy()
+result = db.raise_recommendation_weight_level(
+    dimension="freshness",
+    request_id="server-owned-turn-id",
+    feedback_excerpt="最近推荐的内容整体太旧了",
+    reason="用户明确希望整体推荐更新",
+)
+audit = db.list_recommendation_weight_adjustments(limit=50)
+```
+
+五个 level 都由 SQLite `CHECK` 约束在 `0..3`。写入用独立连接和
+`BEGIN IMMEDIATE` 原子完成“查重→读当前阶→最多加一→写审计”。排序 worker 的策略读取
+也使用一次性只读连接并立即关闭，避免在 Windows 上把临时 SQLite 文件保持为打开状态。
 
 ### Durable event ingress 回执
 

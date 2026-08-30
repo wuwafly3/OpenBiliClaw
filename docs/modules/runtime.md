@@ -123,6 +123,11 @@ RuntimeContext 重建 RecommendationEngine 时透传视觉开关、帧数、两�
 长度；后台 task 通过现有 BackgroundTaskRegistry 管理画像 single-flight rebuild。配置热重载
 后新 embedding provenance 会重新筛选待处理池。
 
+API runtime 的 dialogue 工具由 `CompositeToolDispatcher` 按名字路由：来源订阅工具仍归
+`SourceToolDispatcher`，`raise_recommendation_weight` 归 `RecommendationToolDispatcher`。
+两组名字显式白名单注册，未知名字不会落入任一业务 owner。调权结果直接写同一 SQLite，
+下一次 `PoolCurator` 构建评分上下文时生效，不需要重建 RecommendationEngine 或热重载。
+
 ## 公开 API
 
 ### Durable dialogue execution lane

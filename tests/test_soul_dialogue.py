@@ -422,6 +422,48 @@ async def test_respond_with_tools_never_consults_phantom_core_memory_block() -> 
     assert consulted is False
 
 
+@pytest.mark.asyncio
+async def test_tool_dispatch_receives_server_bound_turn_and_feedback() -> None:
+    captured: dict[str, object] = {}
+
+    class ToolService:
+        async def complete_with_tools(self, **kwargs: object) -> LLMResponse:
+            return LLMResponse(
+                tool_calls=[
+                    {
+                        "name": "raise_recommendation_weight",
+                        "arguments": {"dimension": "freshness", "reason": "整体太旧"},
+                    }
+                ]
+            )
+
+        async def complete_socratic_dialogue(self, **kwargs: object) -> LLMResponse:
+            return LLMResponse(content="已经小幅调整。")
+
+    class CapturingDispatcher:
+        def dispatch(self, tool_call: dict[str, object]) -> str:
+            captured.update(tool_call)
+            return "已调整"
+
+    dialogue = SocraticDialogue(
+        llm=None,
+        soul_engine=FakeSoulEngine(),
+        llm_service=ToolService(),
+        tools=[{"name": "raise_recommendation_weight"}],
+        tool_dispatcher=CapturingDispatcher(),
+        learning_mode=DialogueLearningMode.REPLY_ONLY_TEST,
+    )
+
+    reply = await dialogue.respond(
+        "最近推荐的内容整体太旧了",
+        turn_id="chat-turn-42",
+    )
+
+    assert reply == "已经小幅调整。"
+    assert captured["_request_id"] == "chat-turn-42"
+    assert captured["_user_message"] == "最近推荐的内容整体太旧了"
+
+
 def test_dialogue_reuses_soul_engine_service_identity() -> None:
     shared_service = FakeService(response="共享")
     soul_engine = FakeSoulEngine()

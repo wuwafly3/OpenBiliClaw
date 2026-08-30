@@ -6,6 +6,8 @@
 
 ## 未发布
 
+- **推荐排序支持 LLM 受限阶梯调权**：聊聊口味中，用户明确评价整体推荐“不够相关、太旧、同主题重复、来源单一或太保守”时，LLM 可调用 `raise_recommendation_weight`，但只能选择现有五维之一，不能提交公式或数值系数。后端每次固定升 1 阶、每维最多 3 阶，每阶为归一化前 5%，随后把五维重新归一化到基线总和，避免整体分数尺度漂移。有界原始反馈摘录与服务端 `turn_id` 通过原子 SQLite 审计绑定；重试幂等、冲突维度拒绝、达到上限只记审计不继续抬升。普通单卡 like/dislike 继续走既有软反馈，不会改全局权重。
+
 - **新增四表面推荐曝光账本（ML 排序 Wave 0）**：新表 `recommendation_impressions` 记录推荐窗口在浏览器插件 / 桌面 Web / 移动 Web / CLI 四个表面的真实曝光，补上此前完全缺失的 (曝光, 无互动) 负样本来源——实测既有 1207 条推荐历史里 `presented` 全为 0，`mark_recommendations_presented` 只有 CLI 一个调用点，API 出流路径从不写曝光。表按 `(recommendation_id, surface)` 去重，重复曝光累加 `impression_count` 并保留历史最小 `position`，因此轮询客户端不能刷出多行、也不能洗掉曾排第一的事实；`GET /api/recommendations` 的每条返回路径（含 1 秒缓存命中）都按表面记账，同表面 60 秒内窗口不变则去抖。表面分类以 origin 判插件、以 `Referer` 的 `/web` 与 `/m` 挂载前缀分桌面/移动，无法判定时记 `unknown` 而非丢弃（错标的曝光仍可训练，丢掉的曝光是永久缺失的负样本）。账本与 `recommendations.presented` 严格分离：后者是未读徽标与主动通知的开关，serve 路径写它会同时清零未读并永久静音主动推送。表中不含标题 / URL / 作者 / 推荐文案 / 画像文本，也不含分数列（`recommendations.confidence` insert 后不再更新，按 `recommendation_id` 关联即得不可变的曝光时刻分数）；30 天 / 200,000 行有界保留。写入按 best-effort，遥测失败绝不使用户的推荐请求失败。新增只读脚本 `scripts/ml_impression_status.py` 报告采集进度与 Wave 0 / Wave 2 样本门槛，`scripts/ml_data_probe.py` 报告训练信号存量。
 
 - **项目首页与 README 重新对齐**：补齐一直遗漏的 YouTube / X 来源卡，使首页明确展示 B 站、小红书、抖音、YouTube、X、知乎、Reddit、Linux.do、Bangumi、V2EX、微博与开放 Web；首屏补回“本地运行、只为一个人构建、反馈可调教”的定位，产品入口从过时的“只有浏览器侧边栏”更新为浏览器插件、桌面 Web、移动 Web、Flutter 与 DSH 五端，并修正中文微博文案误用英文、Firefox、架构分层、聚合 Release 说明以及静态 HTML / 中文词典漂移。

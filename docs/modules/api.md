@@ -214,9 +214,14 @@ scope/subject 返回错误；无关系请求继续区分 `ordinary` 与 `detache
 row；相同 `turn_id` 的同一 normalized request 仍幂等，任何 relation/message 分歧返回
 `turn_id_conflict`。
 
+API runtime 的普通对话还注册受限 `raise_recommendation_weight` 工具。只有 LLM 根据用户明确的
+整体排序反馈选中五个已有评分维度之一时才会调用；模型不能传公式、权重值或步数。dispatch 前，
+后端用本次 durable `turn_id` 和原始用户消息覆盖服务端专用字段，因此一次反馈最多生效一次，
+普通单卡 like/dislike 不会进入这条全局调权链路。
+
 | 方法与路径 | 状态 | 契约 |
 |---|---|---|
-| `POST /api/chat/turns` | ✅ | 普通消息在 user row INSERT 前解析可选 `reply_to_turn_id`，冻结 server-owned canonical `DialogueTurnBinding`（bound/ordinary/detached）和 context digest；随后落成 `pending` 并立即返回，只向 app-owned `DurableChatReplyScheduler` 发 wake；单 worker 按 `chat_turns.rowid` 严格串行生成回复，启动会分页恢复全部 pending。provider、限流、配置、超时与取消都保持 pending 并原位有界退避，不能被后续 turn 越过；只有显式无效/空响应可终结为 failed。`scope="hypothesis"` 时服务端生成结构化卡片 payload（`type/kind/ref/title/evidence_refs/actions/state`），直接返回 `status="completed"`，不会调用 LLM worker。若双轨冷却允许，普通 durable 用户消息会先原子插入一条系统确认卡/问题，再写用户 turn；payload 的 `attached_to_turn_id` 负责重试与重启去重。 |
+| `POST /api/chat/turns` | ✅ | 普通消息在 user row INSERT 前解析可选 `reply_to_turn_id`，冻结 server-owned canonical `DialogueTurnBinding`（bound/ordinary/detached）和 context digest；随后落成 `pending` 并立即返回，只向 app-owned `DurableChatReplyScheduler` 发 wake；单 worker 按 `chat_turns.rowid` 严格串行生成回复，启动会分页恢复全部 pending。provider、限流、配置、超时与取消都保持 pending 并原位有界退避，不能被后续 turn 越过；只有显式无效/空响应可终结为 failed。普通对话若调用阶梯调权工具，后端把本 turn ID 和原始反馈绑定到原子审计后才提升一阶，重试不会重复生效。`scope="hypothesis"` 时服务端生成结构化卡片 payload（`type/kind/ref/title/evidence_refs/actions/state`），直接返回 `status="completed"`，不会调用 LLM worker。若双轨冷却允许，普通 durable 用户消息会先原子插入一条系统确认卡/问题，再写用户 turn；payload 的 `attached_to_turn_id` 负责重试与重启去重。 |
 | `GET /api/chat/contexts/{reply_to_turn_id}` | ✅ | 只读返回 canonical context preview（target、kind/ref/generation、可读 evidence、digest）。不创建 queue job、anchor、event，也不修改 card；三端只持久化 target ID，并用 preview 校验恢复。 |
 | `GET /api/chat/turns?session=<label>` | ✅ | `session` 只过滤当前 UI 可见 turn；插件、移动 Web、桌面 Web 的主聊天统一使用 `session=popup` 并读取完整 `chat/hypothesis/confusion` 可见历史，因此三端共享普通消息、确认卡和澄清问题；其它 session 仍可用于隔离集成。不同 UI 仍共享一份认知 history。列表中的每个非终态卡片只 submit `card.reconcile` 到唯一结算队列并返回本次 durable 快照；request task 不直接写 card/object/anchor。 |
 | `GET /api/chat/turns/{turn_id}` | ✅ | 返回单个 durable turn。普通 turn 仍为 pending 时只幂等唤醒同一 reply worker，重复轮询不会复制 queued/in-flight/backoff 工作。若读到非终态卡片，只同步 admission `card.reconcile` 并立即返回快照。worker 会为 `applied=1` receipt 补 stable audit、跨 session projection 与 exact-generation 解锚，也会把没有对应 active anchor 的 orphan `discussing` 校正回 `pending`；因此 publication gap 的第一次 GET 可仍见旧态，queue 完成后的下一次 GET 见权威状态。 |

@@ -52,7 +52,7 @@
 | 初始化分片可观测性 | ✅ | `PreferenceAnalyzer` 为每个并发分片记录带序号的 started / done / failed / cancelled 生命周期和墙钟耗时；guided init 同时把严格递增的完成数回调给 CLI/API。日志只增强定位能力，不改变分片并发、失败传播、超时取消或偏好合并语义 |
 | filter_events_by_satisfaction | ✅ | `soul/event_filters.py` 中的纯函数，按 `inferred_satisfaction` 过滤事件，`"unknown"` 同时匹配缺失 / `None`，使 pre-migration 老行可被显式 opt-in 保留 |
 | recent_negative_exemplars | ✅ | `soul/negative_exemplars.py` 中的纯函数，从事件层拉最近 negative 标题做 recency 加权（半衰期默认 14d）+ 前缀去重 + 80 字截断，最多返回 16 条 `{title, reason, age_days}`。下游消费者是 `discovery/engine.ContentDiscoveryEngine._evaluate_batch` 和 `recommendation/engine.RecommendationEngine._classify_batch`，二者都会把列表作为 `negative_examples` 透传给 batch evaluator prompt——这是 [inferred_satisfaction 信号](#) 的第二个消费方（第一个是上面的 `filter_events_by_satisfaction`） |
-| SocraticDialogue.respond() | ✅ | 通过 LLMService 调用 LLM，自动注入画像；同一 dialogue 实例逐轮串行执行普通与工具调用，用户 turn 在真实回复完成前仅为临时历史，异常/取消只回滚本轮且不触发学习 |
+| SocraticDialogue.respond() | ✅ | 通过 LLMService 调用 LLM，自动注入画像；同一 dialogue 实例逐轮串行执行普通与工具调用，用户 turn 在真实回复完成前仅为临时历史，异常/取消只回滚本轮且不触发学习。工具执行前由服务端补入真实 `turn_id` 与原始用户消息，供有状态工具做幂等和反馈绑定；模型不能伪造这两个字段 |
 | ProfileBuilder 历史抽样（2026-07-26+） | ✅ | `_summarize_history` 不再按到达顺序切`titles[:100]` / `contexts[:100]` / `recent|older[:50]`——真实拉取顺序是最新在前，1000 条历史里模型只看得到最近约 100 条，再久的长期兴趣无论互动多强都不可见（实测生产数据：旧法只覆盖**最近 0.6 天**，且漏掉了全量里唯一一条收藏）。现按「强信号保底 + 时间分层」抽样，与增量链路同源判据：① 权重复用满意度语义——明确互动（收藏/点赞/投币…）3.0 > 高完播 2.0 > 一般 1.0 > 划走 0.3（不归零，划走也是信号）；② 先用 `_HISTORY_STRONG_RESERVE=0.4` 的预算无条件收下明确互动（避免一段时间内集中的收藏被其他时间桶的配额挤掉，与「疑惑被高置信假设埋掉」同类问题），余额再按 `_HISTORY_TIME_BUCKETS=6` 个时间桶均摊，薄桶剩余配额回流给最有代表性的行为；③ 输出按时间排序，`count` 仍报真实总量并附 `sampling_hint` 告知模型这是抽样。无有效时间戳（超过半数缺失）时退回到达顺序，不丢数据。**未改动**：`analyze_events` 的偏好分片仍是 `events[i:i+200]` 全量覆盖，init 的觉察/洞察（`_init_cognition_context`）也无截断——截断问题只存在于画像构建的历史摘要这一处 |
 | ProfileBuilder | ✅ | 结构化 prompt + JSON 校验 + `OnionProfile` 构建；`build_soul_profile_prompt()` 的 system prompt 保持静态，user prompt 按 `<tone_profile>` → `<preference_summary>` → `<recent_awareness>` → `<active_insights>` → `<history_summary>` 排列并使用确定性 JSON，让超大的历史摘要位于 provider cache 前缀末端 |
 | SoulEngine.build_initial_profile() | ✅ | 从 history + preference 生成并持久化 `soul.json` |
@@ -974,6 +974,12 @@ CLI/OpenClaw 两个兼容构造点使用，保留既有 detached direct learning
 queue/guard。每个 `SocraticDialogue` 实例用独立异步锁串行执行完整 turn 事务，
 普通回复与工具调用共享同一顺序；等待锁时取消不会改动历史，持锁期间的 LLM
 异常、超时或取消只删除本轮临时 user turn 并原样重抛，失败内容不进入历史或长期学习。
+
+API runtime 同时注册来源管理工具与推荐侧 `raise_recommendation_weight`。LLM 只返回公开的
+`dimension/reason`；`SocraticDialogue` 在 dispatch 前复制 tool call，并从当前请求补入
+`_request_id=turn_id` 与 `_user_message=原始消息`。推荐工具据此保证同一轮反馈最多生效一次，
+且只有真实、可核对的用户消息才能触发持久调权。CLI/OpenClaw 的兼容 dialogue 未注册该
+有状态工具，行为不变。
 
 `respond(..., session="")` 可逐请求覆盖 UI ownership 标签；认知 history 仍跨 session 共享。`local_timezone` 与测试用 `now_provider` 固定历史时间事实，公开 `format_dialogue_turn_timestamp(timestamp, local_timezone=...)` 将 SQLite 的无时区 UTC 或带 offset 时间统一渲染为 `[MM-DD HH:mm]`，不读取当前时钟。
 
