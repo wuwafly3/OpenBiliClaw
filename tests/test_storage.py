@@ -3643,9 +3643,9 @@ class TestDatabase:
             assert purged == 0
 
             rows = db.get_cached_content(limit=10)
-            assert (
-                rows[0]["pool_status"] == "fresh"
-            ), "Already-recommended items must be preserved for history audit"
+            assert rows[0]["pool_status"] == "fresh", (
+                "Already-recommended items must be preserved for history audit"
+            )
             db.close()
 
     def test_purge_pool_by_disliked_topics_skips_non_fresh_items(self) -> None:
@@ -5696,9 +5696,9 @@ class TestDatabase:
             after_row = db.conn.execute(
                 "SELECT first_event_id FROM seen_items WHERE content_id = 'BVWATCHED'"
             ).fetchone()
-            assert (
-                after_row["first_event_id"] == watched_row["first_event_id"]
-            ), "真实事件的溯源不该被快照覆盖"
+            assert after_row["first_event_id"] == watched_row["first_event_id"], (
+                "真实事件的溯源不该被快照覆盖"
+            )
             assert db.mark_items_seen("bilibili", ["BVSNAP1"]) == 0, "重复标记要幂等"
             db.close()
 

@@ -458,9 +458,9 @@ def test_content_pipeline_imports_from_facade_or_reexport() -> None:
                             import_sources[alias.name] = node.module
             for name in imported:
                 source = import_sources[name]
-                assert (
-                    source in allowed_import_roots
-                ), f"{path.relative_to(_SRC_ROOT)} imports {name} from {source}"
+                assert source in allowed_import_roots, (
+                    f"{path.relative_to(_SRC_ROOT)} imports {name} from {source}"
+                )
 
 
 if __name__ == "__main__":  # pragma: no cover — golden generation helper
