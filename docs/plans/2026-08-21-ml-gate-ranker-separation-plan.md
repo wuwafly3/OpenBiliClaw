@@ -70,14 +70,14 @@
 
 **Steps:**
 
-- [ ] Write one focused failing test：digest 非空但 snapshot 缺失 / 
+- [x] Write one focused failing test：digest 非空但 snapshot 缺失 / 
       `digests_match() is False` 的行在 `--require-snapshot` 下被丢弃。
-- [ ] Run `uv run pytest tests/test_train_relevance_model.py -q` and confirm
+- [x] Run `uv run pytest tests/test_train_relevance_model.py -q` and confirm
       FAIL for the intended missing behavior.
-- [ ] Add `--require-snapshot`（可与现有 `--require-profile-digest` 并存；
+- [x] Add `--require-snapshot`（可与现有 `--require-profile-digest` 并存；
       生产默认走 snapshot）。空 digest 与校验失败计入 stats，不进矩阵。
-- [ ] Rerun the focused test and confirm PASS with no warnings.
-- [ ] Run `uv run ruff check scripts/train_relevance_model.py
+- [x] Rerun the focused test and confirm PASS with no warnings.
+- [x] Run `uv run ruff check scripts/train_relevance_model.py
       tests/test_train_relevance_model.py` 与 touched pytest。
 
 **Acceptance:**

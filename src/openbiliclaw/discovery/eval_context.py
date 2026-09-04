@@ -18,8 +18,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from openbiliclaw.llm.prompt_cache import stable_json_digest
+from openbiliclaw.soul.negative_exemplars import is_shell_negative_title
+from openbiliclaw.soul.profile_views import compact_gate_evaluation_profile_summary
 
 SNAPSHOT_SCHEMA_VERSION = 1
+GATE_RECENT_KEYS = ("recent_awareness", "active_insights", "speculative_interests")
 
 
 def profile_digest_payload(
@@ -107,3 +110,65 @@ class EvaluationContextSnapshot:
             self.profile_digest == self.recomputed_profile_digest()
             and self.negative_digest == self.recomputed_negative_digest()
         )
+
+
+@dataclass(frozen=True)
+class GateContractRewrite:
+    """Old snapshot rewritten to the live gate prompt slice."""
+
+    snapshot: EvaluationContextSnapshot
+    source_profile_digest: str
+    source_negative_digest: str
+    had_recent: bool
+    dropped_shell: int
+
+    @property
+    def digest_changed(self) -> bool:
+        return (
+            self.snapshot.profile_digest != self.source_profile_digest
+            or self.snapshot.negative_digest != self.source_negative_digest
+        )
+
+
+def rewrite_snapshot_to_gate_contract(
+    snapshot: EvaluationContextSnapshot,
+) -> GateContractRewrite:
+    """Drop recent-layer keys and page-shell negatives; recompute digests.
+
+    Does not mutate *snapshot*. Input must already ``digests_match()``.
+    Shell titles are dropped in place; the list is not topped up from events.
+    """
+
+    if not snapshot.digests_match():
+        raise ValueError("snapshot digests do not match payload")
+    had_recent = any(key in snapshot.profile_summary for key in GATE_RECENT_KEYS)
+    summary = compact_gate_evaluation_profile_summary(dict(snapshot.profile_summary))
+    kept: list[dict[str, Any]] = []
+    dropped_shell = 0
+    for item in snapshot.negative_examples:
+        title = str(item.get("title") or "")
+        if is_shell_negative_title(title):
+            dropped_shell += 1
+            continue
+        kept.append(
+            {
+                "title": title,
+                "reason": str(item.get("reason") or ""),
+                "age_days": item.get("age_days"),
+            }
+        )
+    rewritten = EvaluationContextSnapshot(
+        profile_digest=compute_profile_digest(summary, snapshot.recall_pool),
+        negative_digest=compute_negative_digest(kept),
+        profile_summary=summary,
+        recall_pool=list(snapshot.recall_pool),
+        negative_examples=kept,
+        schema_version=int(snapshot.schema_version or SNAPSHOT_SCHEMA_VERSION),
+    )
+    return GateContractRewrite(
+        snapshot=rewritten,
+        source_profile_digest=snapshot.profile_digest,
+        source_negative_digest=snapshot.negative_digest,
+        had_recent=had_recent,
+        dropped_shell=dropped_shell,
+    )

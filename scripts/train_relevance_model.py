@@ -9,7 +9,12 @@ Usage::
 
     uv run --extra ml python scripts/train_relevance_model.py \\
         --db E:/otherproject/OpenBiliClaw/data/openbiliclaw.db \\
-        --require-profile-digest
+        --require-snapshot --dry-run
+
+    uv run --extra ml python scripts/train_relevance_model.py \\
+        --db E:/otherproject/OpenBiliClaw/data/openbiliclaw.db \\
+        --require-snapshot \\
+        --relabel-jsonl data/ml_artifacts/gate_contract_relabel_20260824T030808Z.jsonl
 
 Writes a versioned JSON artifact (weights, scaler, isotonic map, OOF
 metrics). Does not change ``[discovery].relevance_scorer``.
@@ -40,6 +45,13 @@ from export_ranking_dataset import (  # noqa: E402
     teacher_label_select_columns,
 )
 
+from openbiliclaw.discovery.eval_context import (  # noqa: E402
+    GATE_RECENT_KEYS,
+    EvaluationContextSnapshot,
+    loads_snapshot_json,
+    parse_negative_examples,
+    parse_recall_pool,
+)
 from openbiliclaw.discovery.style_keys import normalize_style_key  # noqa: E402
 from openbiliclaw.discovery.temporal import normalize_temporal_class  # noqa: E402
 from openbiliclaw.ml.features import (  # noqa: E402
@@ -113,7 +125,13 @@ def load_teacher_records(
     existing = table_columns(conn, "discovery_candidates")
     optional = select_or_null(
         existing,
-        ("body_text", "rating_score", "source_rank", "profile_digest"),
+        (
+            "body_text",
+            "rating_score",
+            "source_rank",
+            "profile_digest",
+            "negative_digest",
+        ),
     )
     rows = conn.execute(
         f"""
@@ -144,6 +162,7 @@ def load_teacher_records(
         stats[policy] += 1
         strategy = str(row["source_strategy"] or "")
         candidate_digest = str(row["profile_digest"] or "").strip()
+        candidate_negative = str(row["negative_digest"] or "").strip()
         audit_digest = (
             str(entry["profile_digest"] or "").strip()
             if entry is not None and "profile_digest" in entry
@@ -166,6 +185,7 @@ def load_teacher_records(
             "rating_score": float(row["rating_score"] or 0),
             "source_rank": float(row["source_rank"] or 0),
             "candidate_profile_digest": candidate_digest,
+            "candidate_negative_digest": candidate_negative,
             "profile_digest": candidate_digest or audit_digest,
             **{col: float(row[col] or 0) for col in ENGAGEMENT_COLUMNS},
         }
@@ -186,11 +206,149 @@ def filter_records_with_candidate_profile_digest(
     """
 
     kept = [
-        record
-        for record in records
-        if str(record.get("candidate_profile_digest") or "").strip()
+        record for record in records if str(record.get("candidate_profile_digest") or "").strip()
     ]
     return kept, len(records) - len(kept)
+
+
+def load_relabel_overrides(path: Path, id_to_key: dict[int, str]) -> dict[str, dict[str, Any]]:
+    """Map ``candidate_key`` → new-contract score/digest from a relabel JSONL."""
+
+    overrides: dict[str, dict[str, Any]] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        payload = json.loads(text)
+        key = id_to_key.get(int(payload["candidate_id"]))
+        if not key:
+            continue
+        overrides[key] = payload
+    return overrides
+
+
+def apply_relabel_overrides(
+    records: list[dict[str, Any]],
+    overrides: dict[str, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Replace old-contract scores/digests with relabel JSONL values."""
+
+    applied = 0
+    updated: list[dict[str, Any]] = []
+    for record in records:
+        payload = overrides.get(str(record.get("candidate_key") or ""))
+        if payload is None:
+            updated.append(record)
+            continue
+        next_record = dict(record)
+        new_score = float(payload["new_llm_score_raw"])
+        next_record["teacher_score"] = new_score
+        next_record["y"] = int(
+            payload.get("new_y", binary_label(new_score, record.get("strategy")))
+        )
+        next_record["candidate_profile_digest"] = str(payload["new_profile_digest"])
+        next_record["candidate_negative_digest"] = str(payload["new_negative_digest"])
+        next_record["profile_digest"] = str(payload["new_profile_digest"])
+        updated.append(next_record)
+        applied += 1
+    return updated, applied
+
+
+def verified_snapshot_from_row(
+    row: sqlite3.Row,
+) -> EvaluationContextSnapshot | None:
+    summary_raw = loads_snapshot_json(str(row["profile_summary_json"] or ""))
+    if not isinstance(summary_raw, dict):
+        return None
+    snapshot = EvaluationContextSnapshot(
+        profile_digest=str(row["profile_digest"] or ""),
+        negative_digest=str(row["negative_digest"] or ""),
+        profile_summary=dict(summary_raw),
+        recall_pool=parse_recall_pool(loads_snapshot_json(str(row["recall_pool_json"] or ""))),
+        negative_examples=parse_negative_examples(
+            loads_snapshot_json(str(row["negative_examples_json"] or ""))
+        ),
+    )
+    if not snapshot.digests_match():
+        return None
+    return snapshot
+
+
+class _DigestMismatch:
+    """Present snapshot row whose stored payload fails ``digests_match()``."""
+
+    def digests_match(self) -> bool:
+        return False
+
+
+def snapshot_lookup(conn: sqlite3.Connection) -> Any:
+    cache: dict[tuple[str, str], EvaluationContextSnapshot | _DigestMismatch | None] = {}
+
+    def get_evaluation_context_snapshot(
+        *,
+        profile_digest: str,
+        negative_digest: str,
+    ) -> EvaluationContextSnapshot | _DigestMismatch | None:
+        digest = str(profile_digest or "").strip()
+        negative = str(negative_digest or "").strip()
+        if not digest:
+            return None
+        key = (digest, negative)
+        if key in cache:
+            return cache[key]
+        row = conn.execute(
+            """
+            SELECT profile_digest, negative_digest, schema_version,
+                   profile_summary_json, recall_pool_json, negative_examples_json
+            FROM evaluation_context_snapshots
+            WHERE profile_digest = ? AND negative_digest = ?
+            LIMIT 1
+            """,
+            (digest, negative),
+        ).fetchone()
+        if row is None:
+            cache[key] = None
+            return None
+        snapshot = verified_snapshot_from_row(row)
+        cache[key] = snapshot if snapshot is not None else _DigestMismatch()
+        return cache[key]
+
+    return get_evaluation_context_snapshot
+
+
+def filter_records_with_verified_snapshot(
+    records: list[dict[str, Any]],
+    getter: Any,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Keep rows whose digest pair loads a ``digests_match()`` snapshot.
+
+    Empty digest, missing snapshot, and hash mismatch are counted separately
+    and never enter the training matrix.
+    """
+
+    stats: Counter[str] = Counter()
+    kept: list[dict[str, Any]] = []
+    for record in records:
+        digest = str(record.get("candidate_profile_digest") or "").strip()
+        negative = str(record.get("candidate_negative_digest") or "").strip()
+        if not digest or not negative:
+            stats["dropped_empty_digest"] += 1
+            continue
+        snapshot = getter(profile_digest=digest, negative_digest=negative)
+        if snapshot is None:
+            stats["dropped_no_snapshot"] += 1
+            continue
+        match = getattr(snapshot, "digests_match", None)
+        if callable(match) and not match():
+            stats["dropped_digest_mismatch"] += 1
+            continue
+        summary = getattr(snapshot, "profile_summary", None)
+        if isinstance(summary, dict) and any(key in summary for key in GATE_RECENT_KEYS):
+            stats["dropped_old_contract"] += 1
+            continue
+        kept.append(record)
+        stats["kept"] += 1
+    return kept, dict(stats)
 
 
 def encode_teacher_features(
@@ -251,7 +409,14 @@ def pick_threshold(y: np.ndarray, proba: np.ndarray, *, fpr_max: float = 0.10) -
 
 
 def _group_ids(records: list[dict[str, Any]]) -> np.ndarray:
-    labels = [r["profile_digest"] or f"row:{r['candidate_key']}" for r in records]
+    labels: list[str] = []
+    for record in records:
+        profile = str(record.get("profile_digest") or "").strip()
+        negative = str(record.get("candidate_negative_digest") or "").strip()
+        if profile:
+            labels.append(f"{profile}:{negative}")
+        else:
+            labels.append(f"row:{record['candidate_key']}")
     unique = {label: i for i, label in enumerate(sorted(set(labels)))}
     return np.asarray([unique[label] for label in labels], dtype=int)
 
@@ -337,7 +502,7 @@ def train(
         "n_neg": int((1 - y).sum()),
         "n_folds": fold_count,
         "n_groups": n_groups,
-        "group_split": "profile_digest" if n_groups < len(records) else "per-row",
+        "group_split": ("profile_negative_digest" if n_groups < len(records) else "per-row"),
         "dataset_fingerprint": dataset_fingerprint(records),
         "feature_names": feature_names,
         "vocab": vocab,
@@ -417,6 +582,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--require-snapshot",
+        action="store_true",
+        help=(
+            "Train only on rows whose digest pair loads a verified "
+            "evaluation_context_snapshots payload (digests_match). "
+            "Stricter than --require-profile-digest."
+        ),
+    )
+    parser.add_argument(
+        "--relabel-jsonl",
+        type=Path,
+        default=None,
+        help=(
+            "Optional gate-contract relabel JSONL. Overrides teacher_score / y / "
+            "digest pair for matching candidate ids before snapshot filtering."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print filter stats and skip fitting / writing an artifact.",
+    )
+    parser.add_argument(
         "--decision-threshold",
         type=float,
         default=None,
@@ -440,23 +628,57 @@ def main(argv: list[str] | None = None) -> int:
     except ImportError:
         print("scikit-learn required: uv run --extra ml python scripts/train_relevance_model.py")
         return 2
-    conn = connect_readonly(args.db.expanduser().resolve())
+    db_path = args.db.expanduser().resolve()
+    conn = connect_readonly(db_path)
     records, stats = load_teacher_records(conn)
-    conn.close()
     print(f"teacher rows: {len(records)}  provenance={stats}")
-    if bool(args.require_profile_digest):
+    if args.relabel_jsonl is not None:
+        relabel_path = args.relabel_jsonl.expanduser().resolve()
+        if not relabel_path.is_file():
+            print(f"relabel jsonl not found: {relabel_path}")
+            conn.close()
+            return 1
+        id_to_key = {
+            int(row["id"]): str(row["candidate_key"] or "")
+            for row in conn.execute("SELECT id, candidate_key FROM discovery_candidates")
+        }
+        overrides = load_relabel_overrides(relabel_path, id_to_key)
+        records, applied = apply_relabel_overrides(records, overrides)
+        print(f"  relabel-jsonl         {relabel_path.name} applied {applied}")
+    row_filter = "all_teacher"
+    filter_stats: dict[str, int] = {}
+    if bool(args.require_snapshot):
+        getter = snapshot_lookup(conn)
+        records, filter_stats = filter_records_with_verified_snapshot(records, getter)
+        row_filter = "verified_snapshot"
+        print(
+            "  require-snapshot kept "
+            f"{len(records)}  empty={filter_stats.get('dropped_empty_digest', 0)} "
+            f"missing={filter_stats.get('dropped_no_snapshot', 0)} "
+            f"mismatch={filter_stats.get('dropped_digest_mismatch', 0)} "
+            f"old_contract={filter_stats.get('dropped_old_contract', 0)}"
+        )
+    elif bool(args.require_profile_digest):
         records, dropped = filter_records_with_candidate_profile_digest(records)
+        row_filter = "candidate_profile_digest"
         print(
             "  require-profile-digest kept "
             f"{len(records)}  dropped {dropped} (empty candidate digest)"
         )
+    conn.close()
+    if bool(args.dry_run):
+        n_pos = sum(int(r["y"]) for r in records)
+        print(f"  row_filter            {row_filter}")
+        print(f"  kept y                y1={n_pos} y0={len(records) - n_pos}")
+        print("  dry-run               skip fit")
+        return 0 if records else 2
     if len(records) < 40:
         print("not enough teacher rows to train")
         return 1
     payload = train(records, decision_threshold=args.decision_threshold)
-    payload["row_filter"] = (
-        "candidate_profile_digest" if bool(args.require_profile_digest) else "all_teacher"
-    )
+    payload["row_filter"] = row_filter
+    if filter_stats:
+        payload["snapshot_filter"] = filter_stats
     _print_metrics(payload)
     out = args.out.expanduser().resolve()
     out.parent.mkdir(parents=True, exist_ok=True)

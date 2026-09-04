@@ -9,9 +9,9 @@
 
 `ml/` 把教师蒸馏出的浅 **gate**（准入分类器）接到 discovery 评估路径上。训练仍在 `[ml]` extra（scikit-learn）；daemon 只依赖 numpy。Gate 概率只挂内存字段 `ml_admission_*`，**不写** `relevance_score`。
 
-当前特征版本 `admission-teacher-tags-v1`：确定性互动 / 平台 / 策略特征 + **廉价通道** `tag_channel_*`（`topic_group` / `style_key` / `temporal_class`）。教师 `topic_group` / `style_key` / `temporal_*` / `franchise_key` / 分数不得作为运行时特征。默认 artifact 为 `data/ml_artifacts/admission_teacher_v1.json`（`tags_source=teacher_oracle`，`row_filter=candidate_profile_digest`）。2026-08-20 快照子集 870 行、阈值 0.50：OOF AUC 0.741、agreement 0.700。`relevance_scorer` 默认仍为 `llm`。
+当前特征版本 `admission-teacher-tags-v1`：确定性互动 / 平台 / 策略特征 + **廉价通道** `tag_channel_*`（`topic_group` / `style_key` / `temporal_class`）。教师 `topic_group` / `style_key` / `temporal_*` / `franchise_key` / 分数不得作为运行时特征。默认 artifact 为 `data/ml_artifacts/admission_teacher_v1.json`（`tags_source=teacher_oracle`）。生产训练走 `--require-snapshot`（`row_filter=verified_snapshot`）：digest 对必须能取出快照且 `digests_match()`，仍含 recent 的旧合同快照丢弃。可用 `--relabel-jsonl` 在过滤前覆盖 8-20 旧行的新合同分数 / digest。`relevance_scorer` 默认仍为 `llm`。
 
-生产 artifact 的下一步合同（尚未改训练入口）：只训 `evaluation_context_snapshots` 校验通过的行，并补画像相对特征；S1.5 一致率改为 0.95 × 快照自洽天花板（2026-08-20：0.756 → 0.718），Brier 不是合入门槛。Gate 教师画像从 2026-08-21 起不含 recent 层；旧快照若仍含 `recent_awareness` 等键，属另一套教师合同，不得与新切片混训成同一生产 artifact。
+S1.5 一致率改为 0.95 × 快照自洽天花板（2026-08-20：0.756 → 0.718），Brier 不是合入门槛。Gate 教师画像从 2026-08-21 起不含 recent 层。8-20 旧合同行通过 `scripts/ml_gate_contract_relabel.py` 去 recent / 丢壳标题后重打标，新分写入 JSONL，**不**覆盖 `discovery_candidates` 旧分。
 
 已锁定、尚未改运行时：explore 去教师（灰区 ∩（投机挂载 ∪ 高多样性））。不得把 gate p 写入 `relevance_score`。
 
@@ -27,6 +27,8 @@
 | 教师自洽天花板 | 🧪 | `scripts/ml_teacher_self_consistency_probe.py`：同一 pinned 实例复测准入标签；只接受精确 `provider/model`，不混 adapter。有快照则按 digest 分组回放 labeling-time compact 画像。2026-08-20 快照回放 agreement **0.756** |
 | 评估上下文快照 | ✅ | `discovery_candidates.profile_digest` / `negative_digest` + `evaluation_context_snapshots`；新教师标签可按打标时刻 prompt 回放 |
 | Gate 评估不含 recent | ✅ | 教师 / digest 走 `compact_gate_evaluation_profile_summary`；recent 只留给推荐 compact / 未来 ranker |
+| 旧合同重打标 | ✅ | `scripts/ml_gate_contract_relabel.py`：把含 recent / 壳标题的快照改写成新合同，用 pinned `openai-4` 重评。输出 JSONL（old/new 分数并列）。不 UPDATE 候选表。2026-08-24：918 行 / 17 组 / ¥29.26；新 y 504/414，相对旧标签翻转 29.4%。训练读 JSONL，不要再 join 当前 `discovery_candidates.profile_digest` |
+| 生产训练只收验证快照 | ✅ | `scripts/train_relevance_model.py --require-snapshot`：空 digest / 无快照 / digest 不匹配 / 仍含 recent 的旧合同行不进矩阵，`row_filter=verified_snapshot`。`--relabel-jsonl` 可先覆盖旧合同分数。`--dry-run` 只打印过滤统计。2026-08-24 live：无 JSONL kept 229；加 8-24 JSONL kept 1147。第一轮拟合见 `admission_teacher_v1_20260824_snapshot.json`（AUC 0.702 / 0.50 点 agr 0.656）。不改 `relevance_scorer` |
 | 学习排序 ranker | ❌ | 独立开关 `[recommendation].ranker`（尚未落地）；不以教师分为 y |
 | Explore 去教师 | ❌ | 合同已锁（分离 spec Phase 4）；运行时仍是教师 0.58 |
 | 负例壳标题过滤 | ✅ | `recent_negative_exemplars` 只按完整网站标题丢掉 B 站首页干杯标题（短标题视为被完整标题包含）；产品名如 `ChatGLM` 不进黑名单。事件行保留，`negative_digest` 跟过滤后的列表走 |
